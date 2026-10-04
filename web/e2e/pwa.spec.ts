@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
 
-test("the app is installable and shows an offline page without network", async ({ page, context }) => {
+test("the app is installable, precaches its offline page and copes with losing the network", async ({
+  page,
+  context,
+}) => {
   await page.goto("/");
   await expect(page.getByTestId("composer-input")).toBeVisible();
 

@@ -266,8 +266,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     exit_code = 1
     services: List[Service] = []
+
+    def stop_services() -> None:
+        for service in reversed(services):
+            service.stop()
+
     with ExitStack() as stack:
-        stack.callback(lambda: [service.stop() for service in reversed(services)])
+        stack.callback(stop_services)
         try:
             fake = Service(
                 "fake LLM",
@@ -302,7 +307,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Sign in as {ADMIN_USERNAME} / {admin_password}; Ctrl+C stops.")
                 while all(service.process.poll() is None for service in services):
                     time.sleep(1)
-                return 1
+                raise RuntimeError("a service stopped unexpectedly")
 
             playwright = ["npx", "playwright", "test"]
             if args.screenshots:

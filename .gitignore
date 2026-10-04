@@ -3,7 +3,7 @@
 logs/
 
 # Data
-data/
+/data/
 
 # Workspace
 workspace/
@@ -19,17 +19,17 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+/build/
 develop-eggs/
 dist/
-downloads/
+/downloads/
 eggs/
 .eggs/
-lib/
+/lib/
 lib64/
-parts/
+/parts/
 sdist/
-var/
+/var/
 wheels/
 share/python-wheels/
 *.egg-info/
@@ -200,3 +200,10 @@ cython_debug/
 
 # node
 node_modules
+
+# OpenManus web
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+config/config.toml.bak

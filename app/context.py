@@ -13,6 +13,7 @@ questions.
 from __future__ import annotations
 
 import os
+import stat
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,7 +106,9 @@ def resolve_in_workspace(path: Union[str, Path]) -> Path:
     workspace, otherwise :class:`WorkspaceViolation` is raised.
     """
     workspace = get_workspace()
-    raw = Path(os.path.expanduser(str(path))) if str(path).startswith("~") else Path(path)
+    raw = (
+        Path(os.path.expanduser(str(path))) if str(path).startswith("~") else Path(path)
+    )
     candidate = raw if raw.is_absolute() else workspace / raw
     resolved = candidate.resolve()
 
@@ -142,8 +145,14 @@ def prepare_workspace(path: Union[str, Path]) -> Path:
         uid, gid = ids
         for root, dirs, files in os.walk(workspace):
             for name in [*dirs, *files]:
+                entry = os.path.join(root, name)
                 try:
-                    os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
+                    st = os.lstat(entry)
+                    # A hard link may point at a protected file elsewhere (e.g. the
+                    # secret key); chowning it would hand that file to agent code.
+                    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                        continue
+                    os.chown(entry, uid, gid, follow_symlinks=False)
                 except OSError:
                     pass
         try:

@@ -10,7 +10,7 @@
   </radialGradient></defs>
   <rect width="512" height="512" rx="112" fill="url(#bg)"/>
   <rect width="512" height="512" rx="112" fill="url(#glow)"/>
-  
+
   <g transform="translate(0 0) scale(1)">
     <path d="M148 360V196l108 104 108-104v164" fill="none" stroke="#FFFFFF"
       stroke-width="46" stroke-linecap="round" stroke-linejoin="round"/>

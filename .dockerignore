@@ -31,8 +31,7 @@ venv
 # Node dependencies and build output (installed/built inside the image)
 **/node_modules
 web/dist
-web/e2e
-web/playwright.config.ts
+# web/e2e stays in the context: web/tsconfig.json references it and the build reads it.
 web/test-results
 web/playwright-report
 web/blob-report

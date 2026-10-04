@@ -40,7 +40,8 @@ def _pid_alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as stat:
             return stat.read().split()[2] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # The process can exit between kill(0) and reading /proc.
         return False
 
 

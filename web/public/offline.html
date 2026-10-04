@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#121214" />
+    <title>OpenManus — offline</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        font:
+          16px/1.5 system-ui,
+          -apple-system,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+        background: #ffffff;
+        color: #18181b;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: #121214;
+          color: #f4f4f5;
+        }
+        p {
+          color: #a1a1aa;
+        }
+      }
+      main {
+        max-width: 360px;
+        text-align: center;
+      }
+      img {
+        width: 64px;
+        height: 64px;
+        border-radius: 16px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 16px 0 4px;
+      }
+      p {
+        margin: 0 0 4px;
+        color: #52525b;
+      }
+      a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 44px;
+        margin-top: 20px;
+        padding: 0 20px;
+        border-radius: 12px;
+        background: #6366f1;
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/icons/icon-192.png" alt="" />
+      <h1>You're offline · Нет соединения</h1>
+      <p>OpenManus needs a network connection.</p>
+      <p>Для работы OpenManus нужно подключение к сети.</p>
+      <a href="/">Retry · Повторить</a>
+    </main>
+  </body>
+</html>

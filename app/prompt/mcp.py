@@ -18,6 +18,7 @@ Follow these guidelines:
 - If multiple tools need to be called in sequence, make one call at a time and wait for results
 
 Remember to clearly explain your reasoning and actions to the user.
+Always reply in the language of the user's request.
 """
 
 NEXT_STEP_PROMPT = """Based on the current state and available tools, what should be done next?

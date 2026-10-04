@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 
-from app.agent.sandbox_agent import SandboxManus
+from app.agent.registry import create_agent, dispose_agent
 from app.logger import logger
 
 
@@ -13,8 +13,12 @@ async def main():
     )
     args = parser.parse_args()
 
-    # Create and initialize Manus agent
-    agent = await SandboxManus.create()
+    # Create the sandbox agent (needs a Daytona API key in config.toml)
+    try:
+        agent = await create_agent("sandbox")
+    except ValueError as e:
+        logger.error(str(e))
+        return
     try:
         # Use command line prompt if provided, otherwise ask for input
         prompt = args.prompt if args.prompt else input("Enter your prompt: ")
@@ -29,7 +33,7 @@ async def main():
         logger.warning("Operation interrupted.")
     finally:
         # Ensure agent resources are cleaned up before exiting
-        await agent.cleanup()
+        await dispose_agent(agent)
 
 
 if __name__ == "__main__":

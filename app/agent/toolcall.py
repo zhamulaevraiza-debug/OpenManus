@@ -5,14 +5,55 @@ from typing import Any, List, Optional, Union
 from pydantic import Field
 
 from app.agent.react import ReActAgent
+from app.context import current_run, emit
 from app.exceptions import TokenLimitExceeded
 from app.logger import logger
 from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
-from app.tool import CreateChatCompletion, Terminate, ToolCollection
+from app.schema import TOOL_CHOICE_TYPE, Message, ToolCall, ToolChoice
+from app.tool.base import ToolResult
+from app.tool.create_chat_completion import CreateChatCompletion
+from app.tool.terminate import Terminate
+from app.tool.tool_collection import ToolCollection
+from app.utils.text import truncate
 
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
+
+# Size limits for event payloads (UI) and log previews.
+EVENT_OUTPUT_LIMIT = 8000
+LOG_PREVIEW_LIMIT = 500
+
+
+def _event_arguments(raw_arguments: Optional[str]) -> dict:
+    """Tool call arguments for events: the JSON object, or ``{"raw": text}``."""
+    try:
+        parsed = json.loads(raw_arguments or "{}")
+    except (TypeError, json.JSONDecodeError):
+        parsed = None
+    if not isinstance(parsed, dict):
+        return {"raw": truncate(raw_arguments or "", EVENT_OUTPUT_LIMIT)}
+    return {
+        key: truncate(value, EVENT_OUTPUT_LIMIT) if isinstance(value, str) else value
+        for key, value in parsed.items()
+    }
+
+
+def _log_detail(message: str) -> None:
+    """Log thoughts, arguments and results (truncated): visible on the CLI, DEBUG
+    level in web runs where they belong to the user's event stream."""
+    logger.log(
+        "INFO" if current_run() is None else "DEBUG",
+        truncate(message, LOG_PREVIEW_LIMIT),
+    )
+
+
+def _is_error_result(result: Any) -> bool:
+    """Whether a tool's return value reports a failure."""
+    if isinstance(result, ToolResult):
+        return bool(result.error)
+    if isinstance(result, dict) and "success" in result:
+        return not result["success"]
+    return False
 
 
 class ToolCallAgent(ReActAgent):
@@ -24,23 +65,34 @@ class ToolCallAgent(ReActAgent):
     system_prompt: str = SYSTEM_PROMPT
     next_step_prompt: str = NEXT_STEP_PROMPT
 
-    available_tools: ToolCollection = ToolCollection(
-        CreateChatCompletion(), Terminate()
+    available_tools: ToolCollection = Field(
+        default_factory=lambda: ToolCollection(CreateChatCompletion(), Terminate())
     )
     tool_choices: TOOL_CHOICE_TYPE = ToolChoice.AUTO  # type: ignore
     special_tool_names: List[str] = Field(default_factory=lambda: [Terminate().name])
 
     tool_calls: List[ToolCall] = Field(default_factory=list)
     _current_base64_image: Optional[str] = None
+    _current_tool_error: bool = False
 
     max_steps: int = 30
     max_observe: Optional[Union[int, bool]] = None
+    cleanup_after_run: bool = Field(
+        default=True, description="Release tool resources at the end of every run()"
+    )
+
+    def _step_prompt(self) -> Optional[str]:
+        """The next-step prompt, prefixed by a pending stuck hint."""
+        hint = self.consume_stuck_hint()
+        if hint and self.next_step_prompt:
+            return f"{hint}\n{self.next_step_prompt}"
+        return hint or self.next_step_prompt
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
-        if self.next_step_prompt:
-            user_msg = Message.user_message(self.next_step_prompt)
-            self.messages += [user_msg]
+        prompt = self._step_prompt()
+        if prompt:
+            self.memory.add_message(Message.user_message(prompt))
 
         try:
             # Get response with tool options
@@ -54,39 +106,35 @@ class ToolCallAgent(ReActAgent):
                 tools=self.available_tools.to_params(),
                 tool_choice=self.tool_choices,
             )
-        except ValueError:
-            raise
-        except Exception as e:
-            # Check if this is a RetryError containing TokenLimitExceeded
-            if hasattr(e, "__cause__") and isinstance(e.__cause__, TokenLimitExceeded):
-                token_limit_error = e.__cause__
-                logger.error(
-                    f"🚨 Token limit error (from RetryError): {token_limit_error}"
+        except TokenLimitExceeded as e:
+            logger.error(f"🚨 Token limit error: {e}")
+            self.memory.add_message(
+                Message.assistant_message(
+                    f"Maximum token limit reached, cannot continue execution: {e}"
                 )
-                self.memory.add_message(
-                    Message.assistant_message(
-                        f"Maximum token limit reached, cannot continue execution: {str(token_limit_error)}"
-                    )
-                )
-                self.state = AgentState.FINISHED
-                return False
-            raise
+            )
+            self.finish("error")
+            return False
 
         self.tool_calls = tool_calls = (
             response.tool_calls if response and response.tool_calls else []
         )
         content = response.content if response and response.content else ""
 
-        # Log response info
-        logger.info(f"✨ {self.name}'s thoughts: {content}")
-        logger.info(
-            f"🛠️ {self.name} selected {len(tool_calls) if tool_calls else 0} tools to use"
-        )
-        if tool_calls:
-            logger.info(
-                f"🧰 Tools being prepared: {[call.function.name for call in tool_calls]}"
+        if content:
+            emit(
+                "agent.thought",
+                agent=self.name,
+                step=self.current_step,
+                content=content,
             )
-            logger.info(f"🔧 Tool arguments: {tool_calls[0].function.arguments}")
+            _log_detail(f"✨ {self.name}'s thoughts: {content}")
+        logger.info(
+            f"🛠️ {self.name} selected {len(tool_calls)} tools to use"
+            + (f": {[call.function.name for call in tool_calls]}" if tool_calls else "")
+        )
+        for call in tool_calls:
+            _log_detail(f"🔧 {call.function.name} arguments: {call.function.arguments}")
 
         try:
             if response is None:
@@ -114,8 +162,9 @@ class ToolCallAgent(ReActAgent):
             if self.tool_choices == ToolChoice.REQUIRED and not self.tool_calls:
                 return True  # Will be handled in act()
 
-            # For 'auto' mode, continue with content if no commands but content exists
+            # In 'auto' mode a reply without tool calls is the agent's answer.
             if self.tool_choices == ToolChoice.AUTO and not self.tool_calls:
+                self.finish("no_action")
                 return bool(content)
 
             return bool(self.tool_calls)
@@ -139,17 +188,35 @@ class ToolCallAgent(ReActAgent):
 
         results = []
         for command in self.tool_calls:
-            # Reset base64_image for each tool call
+            # Reset per-call side channels of execute_tool
             self._current_base64_image = None
+            self._current_tool_error = False
+            emit(
+                "tool.call",
+                agent=self.name,
+                step=self.current_step,
+                call_id=command.id,
+                name=command.function.name,
+                arguments=_event_arguments(command.function.arguments),
+            )
 
             result = await self.execute_tool(command)
 
             if self.max_observe:
                 result = result[: self.max_observe]
 
-            logger.info(
-                f"🎯 Tool '{command.function.name}' completed its mission! Result: {result}"
-            )
+            _log_detail(f"🎯 Tool '{command.function.name}' completed! Result: {result}")
+            event = {
+                "agent": self.name,
+                "step": self.current_step,
+                "call_id": command.id,
+                "name": command.function.name,
+                "output": truncate(result, EVENT_OUTPUT_LIMIT),
+                "error": self._current_tool_error,
+            }
+            if self._current_base64_image:
+                event["image_b64"] = self._current_base64_image
+            emit("tool.result", **event)
 
             # Add tool response to memory
             tool_msg = Message.tool_message(
@@ -164,12 +231,18 @@ class ToolCallAgent(ReActAgent):
         return "\n\n".join(results)
 
     async def execute_tool(self, command: ToolCall) -> str:
-        """Execute a single tool call with robust error handling"""
+        """Execute a single tool call with robust error handling.
+
+        Besides the returned observation, the base64 image of the result and whether
+        it failed are recorded in ``_current_base64_image`` / ``_current_tool_error``.
+        """
         if not command or not command.function or not command.function.name:
+            self._current_tool_error = True
             return "Error: Invalid command format"
 
         name = command.function.name
         if name not in self.available_tools.tool_map:
+            self._current_tool_error = True
             return f"Error: Unknown tool '{name}'"
 
         try:
@@ -183,10 +256,10 @@ class ToolCallAgent(ReActAgent):
             # Handle special tools
             await self._handle_special_tool(name=name, result=result)
 
-            # Check if result is a ToolResult with base64_image
-            if hasattr(result, "base64_image") and result.base64_image:
-                # Store the base64_image for later use in tool_message
+            # Keep the screenshot for the tool message and the tool.result event
+            if getattr(result, "base64_image", None):
                 self._current_base64_image = result.base64_image
+            self._current_tool_error = _is_error_result(result)
 
             # Format result for display (standard case)
             observation = (
@@ -197,12 +270,15 @@ class ToolCallAgent(ReActAgent):
 
             return observation
         except json.JSONDecodeError:
+            self._current_tool_error = True
             error_msg = f"Error parsing arguments for {name}: Invalid JSON format"
             logger.error(
-                f"📝 Oops! The arguments for '{name}' don't make sense - invalid JSON, arguments:{command.function.arguments}"
+                f"📝 Oops! The arguments for '{name}' don't make sense - invalid JSON, "
+                f"arguments: {truncate(command.function.arguments or '', LOG_PREVIEW_LIMIT)}"
             )
             return f"Error: {error_msg}"
         except Exception as e:
+            self._current_tool_error = True
             error_msg = f"⚠️ Tool '{name}' encountered a problem: {str(e)}"
             logger.exception(error_msg)
             return f"Error: {error_msg}"
@@ -213,9 +289,8 @@ class ToolCallAgent(ReActAgent):
             return
 
         if self._should_finish_execution(name=name, result=result, **kwargs):
-            # Set agent state to finished
             logger.info(f"🏁 Special tool '{name}' has completed the task!")
-            self.state = AgentState.FINISHED
+            self.finish("terminated")
 
     @staticmethod
     def _should_finish_execution(**kwargs) -> bool:
@@ -223,12 +298,15 @@ class ToolCallAgent(ReActAgent):
         return True
 
     def _is_special_tool(self, name: str) -> bool:
-        """Check if tool name is in special tools list"""
-        return name.lower() in [n.lower() for n in self.special_tool_names]
+        """Check if a tool is special, by name or by its original (e.g. MCP) name"""
+        special = {n.lower() for n in self.special_tool_names}
+        tool = self.available_tools.get_tool(name) if self.available_tools else None
+        original_name = getattr(tool, "original_name", "") or ""
+        return name.lower() in special or original_name.lower() in special
 
     async def cleanup(self):
         """Clean up resources used by the agent's tools."""
-        logger.info(f"🧹 Cleaning up resources for agent '{self.name}'...")
+        logger.debug(f"🧹 Cleaning up resources for agent '{self.name}'...")
         for tool_name, tool_instance in self.available_tools.tool_map.items():
             if hasattr(tool_instance, "cleanup") and asyncio.iscoroutinefunction(
                 tool_instance.cleanup
@@ -237,14 +315,15 @@ class ToolCallAgent(ReActAgent):
                     logger.debug(f"🧼 Cleaning up tool: {tool_name}")
                     await tool_instance.cleanup()
                 except Exception as e:
-                    logger.error(
-                        f"🚨 Error cleaning up tool '{tool_name}': {e}", exc_info=True
+                    logger.opt(exception=e).error(
+                        f"🚨 Error cleaning up tool '{tool_name}': {e}"
                     )
-        logger.info(f"✨ Cleanup complete for agent '{self.name}'.")
+        logger.debug(f"✨ Cleanup complete for agent '{self.name}'.")
 
     async def run(self, request: Optional[str] = None) -> str:
-        """Run the agent with cleanup when done."""
+        """Run the agent, releasing tool resources afterwards (``cleanup_after_run``)."""
         try:
             return await super().run(request)
         finally:
-            await self.cleanup()
+            if self.cleanup_after_run:
+                await self.cleanup()

@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 
-from app.agent.manus import Manus
+from app.agent.registry import create_agent, dispose_agent
 from app.logger import logger
 
 
@@ -14,7 +14,7 @@ async def main():
     args = parser.parse_args()
 
     # Create and initialize Manus agent
-    agent = await Manus.create()
+    agent = await create_agent("manus")
     try:
         # Use command line prompt if provided, otherwise ask for input
         prompt = args.prompt if args.prompt else input("Enter your prompt: ")
@@ -27,10 +27,17 @@ async def main():
         logger.info("Request processing completed.")
     except KeyboardInterrupt:
         logger.warning("Operation interrupted.")
+    except Exception as e:
+        logger.error(f"Request failed: {e}")
     finally:
         # Ensure agent resources are cleaned up before exiting
-        await agent.cleanup()
+        await dispose_agent(agent)
+
+
+def cli() -> None:
+    """Console script entry point (``openmanus``)."""
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli()

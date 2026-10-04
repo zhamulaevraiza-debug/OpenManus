@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from app.agent.toolcall import ToolCallAgent
 from app.logger import logger
@@ -25,7 +25,10 @@ class MCPAgent(ToolCallAgent):
 
     # Initialize MCP tool collection
     mcp_clients: MCPClients = Field(default_factory=MCPClients)
-    available_tools: MCPClients = None  # Will be set in initialize()
+    available_tools: Optional[MCPClients] = None  # Will be set in initialize()
+
+    # The connection outlives single runs (interactive use); call cleanup() when done.
+    cleanup_after_run: bool = False
 
     max_steps: int = 20
     connection_type: str = "stdio"  # "stdio" or "sse"
@@ -34,8 +37,11 @@ class MCPAgent(ToolCallAgent):
     tool_schemas: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     _refresh_tools_interval: int = 5  # Refresh tools every N steps
 
-    # Special tool names that should trigger termination
+    # Special tool names that should trigger termination (matched against the
+    # server-side tool name too, since MCP tools are exposed as mcp_<server>_<name>)
     special_tool_names: List[str] = Field(default_factory=lambda: ["terminate"])
+
+    _base_system_prompt: Optional[str] = PrivateAttr(default=None)
 
     async def initialize(
         self,
@@ -73,15 +79,12 @@ class MCPAgent(ToolCallAgent):
         # Store initial tool schemas
         await self._refresh_tools()
 
-        # Add system message about available tools
-        tool_names = list(self.mcp_clients.tool_map.keys())
-        tools_info = ", ".join(tool_names)
-
-        # Add system prompt and available tools information
-        self.memory.add_message(
-            Message.system_message(
-                f"{self.system_prompt}\n\nAvailable MCP tools: {tools_info}"
-            )
+        # Tell the model which tools exist (the system prompt is sent on every call)
+        if self._base_system_prompt is None:
+            self._base_system_prompt = self.system_prompt
+        tools_info = ", ".join(self.mcp_clients.tool_map.keys())
+        self.system_prompt = (
+            f"{self._base_system_prompt}\n\nAvailable MCP tools: {tools_info}"
         )
 
     async def _refresh_tools(self) -> Tuple[List[str], List[str]]:
@@ -164,22 +167,8 @@ class MCPAgent(ToolCallAgent):
                 )
             )
 
-    def _should_finish_execution(self, name: str, **kwargs) -> bool:
-        """Determine if tool execution should finish the agent"""
-        # Terminate if the tool name is 'terminate'
-        return name.lower() == "terminate"
-
     async def cleanup(self) -> None:
         """Clean up MCP connection when done."""
         if self.mcp_clients.sessions:
             await self.mcp_clients.disconnect()
             logger.info("MCP connection closed")
-
-    async def run(self, request: Optional[str] = None) -> str:
-        """Run the agent with cleanup when done."""
-        try:
-            result = await super().run(request)
-            return result
-        finally:
-            # Ensure cleanup happens even if there's an error
-            await self.cleanup()

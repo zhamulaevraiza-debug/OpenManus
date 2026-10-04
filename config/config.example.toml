@@ -5,6 +5,7 @@ base_url = "https://api.anthropic.com/v1/" # API endpoint URL
 api_key = "YOUR_API_KEY"                   # Your API key
 max_tokens = 8192                          # Maximum number of tokens in the response
 temperature = 0.0                          # Controls randomness
+# supports_images = true                  # Whether the model accepts images; omit to guess from the model name
 
 # [llm] # Amazon Bedrock
 # api_type = "aws"                                       # Required
@@ -57,7 +58,8 @@ temperature = 0.0                          # Controls randomness for vision mode
 
 # Optional configuration for specific browser configuration
 # [browser]
-# Whether to run browser in headless mode (default: false)
+# Whether to run browser in headless mode (default: true when there is no display,
+# e.g. on servers and in Docker; env OPENMANUS_BROWSER_HEADLESS overrides it)
 #headless = false
 # Disable browser security features (default: true)
 #disable_security = true
@@ -106,6 +108,18 @@ temperature = 0.0                          # Controls randomness for vision mode
 # MCP (Model Context Protocol) configuration
 [mcp]
 server_reference = "app.mcp.server" # default server module reference
+
+# Optional multi-agent team configuration (team mode of the web UI and run_flow.py)
+# [team]
+# Maximum number of steps in a team plan (1-50). Default is 8.
+#max_plan_steps = 8
+
+# Optional limits of the agents started by the web UI
+# [runtime]
+# Maximum steps of a single agent run (1-500). Default is 20.
+#max_steps = 20
+
+# Optional Daytona cloud sandbox (enables the "sandbox" agent): see config.example-daytona.toml
 
 # Optional Runflow configuration
 # Your can add additional agents into run-flow workflow to solve different-type tasks.

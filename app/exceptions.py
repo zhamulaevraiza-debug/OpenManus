@@ -16,3 +16,7 @@ class OpenManusError(Exception):
 
 class TokenLimitExceeded(OpenManusError):
     """Exception raised when the token limit is exceeded"""
+
+
+class ConfigurationError(OpenManusError):
+    """Raised when required configuration (credentials, endpoints, ...) is missing or invalid."""

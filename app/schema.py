@@ -82,19 +82,8 @@ class Message(BaseModel):
             )
 
     def to_dict(self) -> dict:
-        """Convert message to dictionary format"""
-        message = {"role": self.role}
-        if self.content is not None:
-            message["content"] = self.content
-        if self.tool_calls is not None:
-            message["tool_calls"] = [tool_call.dict() for tool_call in self.tool_calls]
-        if self.name is not None:
-            message["name"] = self.name
-        if self.tool_call_id is not None:
-            message["tool_call_id"] = self.tool_call_id
-        if self.base64_image is not None:
-            message["base64_image"] = self.base64_image
-        return message
+        """Convert message to dictionary format (fields that are None are omitted)"""
+        return self.model_dump(exclude_none=True)
 
     @classmethod
     def user_message(
@@ -140,13 +129,15 @@ class Message(BaseModel):
 
         Args:
             tool_calls: Raw tool calls from LLM
-            content: Optional message content
+            content: Optional message content (a list of strings is joined by newlines)
             base64_image: Optional base64 encoded image
         """
         formatted_calls = [
             {"id": call.id, "function": call.function.model_dump(), "type": "function"}
             for call in tool_calls
         ]
+        if isinstance(content, list):
+            content = "\n".join(content)
         return cls(
             role=Role.ASSISTANT,
             content=content,
@@ -156,23 +147,53 @@ class Message(BaseModel):
         )
 
 
+IMAGE_OMITTED = "[image omitted]"
+
+
 class Memory(BaseModel):
+    """Conversation history of an agent.
+
+    The history is bounded: at most ``max_messages`` messages are kept (trimming never
+    leaves tool results without their assistant tool call) and only the latest
+    ``max_images`` messages keep their base64 image.
+    """
+
     messages: List[Message] = Field(default_factory=list)
     max_messages: int = Field(default=100)
+    max_images: int = Field(default=2)
 
     def add_message(self, message: Message) -> None:
         """Add a message to memory"""
         self.messages.append(message)
-        # Optional: Implement message limit
-        if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages :]
+        self._enforce_limits()
 
     def add_messages(self, messages: List[Message]) -> None:
         """Add multiple messages to memory"""
         self.messages.extend(messages)
-        # Optional: Implement message limit
+        self._enforce_limits()
+
+    def _enforce_limits(self) -> None:
         if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages :]
+            start = len(self.messages) - self.max_messages
+            # Tool results whose assistant tool call was cut off would be rejected
+            # by the API, so the kept history must not start with them.
+            while start < len(self.messages) and self.messages[start].role == Role.TOOL:
+                start += 1
+            self.messages = self.messages[start:]
+
+        images_kept = 0
+        for message in reversed(self.messages):
+            if not message.base64_image:
+                continue
+            if images_kept < self.max_images:
+                images_kept += 1
+                continue
+            message.base64_image = None
+            message.content = (
+                f"{message.content}\n{IMAGE_OMITTED}"
+                if message.content
+                else IMAGE_OMITTED
+            )
 
     def clear(self) -> None:
         """Clear all messages"""

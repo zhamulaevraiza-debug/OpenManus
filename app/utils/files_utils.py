@@ -1,4 +1,5 @@
 import os
+import posixpath
 
 
 # Files to exclude from operations
@@ -63,25 +64,22 @@ def should_exclude_file(rel_path: str) -> bool:
 def clean_path(path: str, workspace_path: str = "/workspace") -> str:
     """Clean and normalize a path to be relative to the workspace
 
+    ``..`` segments are resolved against the workspace root, so the result never
+    points outside of it.
+
     Args:
         path: The path to clean
         workspace_path: The base workspace path to remove (default: "/workspace")
 
     Returns:
-        The cleaned path, relative to the workspace
+        The cleaned path, relative to the workspace ("" for the workspace itself)
     """
-    # Remove any leading slash
-    path = path.lstrip("/")
+    relative = posixpath.normpath("/" + path.strip()).lstrip("/")
 
-    # Remove workspace prefix if present
-    if path.startswith(workspace_path.lstrip("/")):
-        path = path[len(workspace_path.lstrip("/")) :]
+    # Remove the workspace prefix if present
+    for prefix in (workspace_path.strip("/"), "workspace"):
+        if prefix and (relative == prefix or relative.startswith(prefix + "/")):
+            relative = relative[len(prefix) :].lstrip("/")
+            break
 
-    # Remove workspace/ prefix if present
-    if path.startswith("workspace/"):
-        path = path[9:]
-
-    # Remove any remaining leading slash
-    path = path.lstrip("/")
-
-    return path
+    return relative

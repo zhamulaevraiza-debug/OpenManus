@@ -7,8 +7,9 @@ from app.agent.toolcall import ToolCallAgent
 from app.logger import logger
 from app.prompt.browser import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import Message, ToolChoice
-from app.tool import BrowserUseTool, Terminate, ToolCollection
-from app.tool.sandbox.sb_browser_tool import SandboxBrowserTool
+from app.tool.browser_use_tool import BrowserUseTool
+from app.tool.terminate import Terminate
+from app.tool.tool_collection import ToolCollection
 
 
 # Avoid circular import if BrowserAgent needs BrowserContextHelper
@@ -16,17 +17,44 @@ if TYPE_CHECKING:
     from app.agent.base import BaseAgent  # Or wherever memory is defined
 
 
+# Names of the local (browser_use) and Daytona sandbox browser tools. Using names
+# instead of the classes keeps the Daytona stack out of the import graph.
+BROWSER_TOOL_NAME = "browser_use"
+SANDBOX_BROWSER_TOOL_NAME = "sandbox_browser"
+BROWSER_TOOL_NAMES = (BROWSER_TOOL_NAME, SANDBOX_BROWSER_TOOL_NAME)
+
+
 class BrowserContextHelper:
+    """Builds the browser-state prompt (with a screenshot) for browsing agents."""
+
     def __init__(self, agent: "BaseAgent"):
         self.agent = agent
         self._current_base64_image: Optional[str] = None
 
+    def _browser_tool(self):
+        for name in BROWSER_TOOL_NAMES:
+            tool = self.agent.available_tools.get_tool(name)
+            if tool is not None:
+                return tool
+        return None
+
+    def browser_recently_used(self, lookback: int = 3) -> bool:
+        """Whether one of the last ``lookback`` messages called a browser tool."""
+        return any(
+            call.function.name in BROWSER_TOOL_NAMES
+            for message in self.agent.memory.messages[-lookback:]
+            for call in message.tool_calls or []
+        )
+
+    def _latest_result_has_image(self) -> bool:
+        """Whether the latest memory message is a tool result with a screenshot."""
+        messages = self.agent.memory.messages
+        return bool(
+            messages and messages[-1].role == "tool" and messages[-1].base64_image
+        )
+
     async def get_browser_state(self) -> Optional[dict]:
-        browser_tool = self.agent.available_tools.get_tool(BrowserUseTool().name)
-        if not browser_tool:
-            browser_tool = self.agent.available_tools.get_tool(
-                SandboxBrowserTool().name
-            )
+        browser_tool = self._browser_tool()
         if not browser_tool or not hasattr(browser_tool, "get_current_state"):
             logger.warning("BrowserUseTool not found or doesn't have get_current_state")
             return None
@@ -55,20 +83,23 @@ class BrowserContextHelper:
             tabs = browser_state.get("tabs", [])
             if tabs:
                 tabs_info = f"\n   {len(tabs)} tab(s) available"
-            pixels_above = browser_state.get("pixels_above", 0)
-            pixels_below = browser_state.get("pixels_below", 0)
+            scroll_info = browser_state.get("scroll_info") or browser_state
+            pixels_above = scroll_info.get("pixels_above", 0)
+            pixels_below = scroll_info.get("pixels_below", 0)
             if pixels_above > 0:
                 content_above_info = f" ({pixels_above} pixels)"
             if pixels_below > 0:
                 content_below_info = f" ({pixels_below} pixels)"
 
-            if self._current_base64_image:
+            # Browser actions already return a screenshot with their result; add
+            # the state screenshot only when the model has not just seen the page.
+            if self._current_base64_image and not self._latest_result_has_image():
                 image_message = Message.user_message(
                     content="Current browser screenshot:",
                     base64_image=self._current_base64_image,
                 )
                 self.agent.memory.add_message(image_message)
-                self._current_base64_image = None  # Consume the image after adding
+            self._current_base64_image = None  # Consume the image
 
         return NEXT_STEP_PROMPT.format(
             url_placeholder=url_info,
@@ -78,10 +109,13 @@ class BrowserContextHelper:
             results_placeholder=results_info,
         )
 
-    async def cleanup_browser(self):
-        browser_tool = self.agent.available_tools.get_tool(BrowserUseTool().name)
-        if browser_tool and hasattr(browser_tool, "cleanup"):
-            await browser_tool.cleanup()
+    async def next_step_prompt_for(
+        self, default_prompt: Optional[str]
+    ) -> Optional[str]:
+        """The browser-state prompt while the browser is in use, else ``default_prompt``."""
+        if self.browser_recently_used():
+            return await self.format_next_step_prompt()
+        return default_prompt
 
 
 class BrowserAgent(ToolCallAgent):
@@ -123,7 +157,3 @@ class BrowserAgent(ToolCallAgent):
             await self.browser_context_helper.format_next_step_prompt()
         )
         return await super().think()
-
-    async def cleanup(self):
-        """Clean up browser agent resources by calling parent cleanup."""
-        await self.browser_context_helper.cleanup_browser()

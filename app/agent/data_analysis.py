@@ -1,12 +1,13 @@
 from pydantic import Field
 
 from app.agent.toolcall import ToolCallAgent
-from app.config import config
+from app.context import get_workspace
 from app.prompt.visualization import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.tool import Terminate, ToolCollection
 from app.tool.chart_visualization.chart_prepare import VisualizationPrepare
 from app.tool.chart_visualization.data_visualization import DataVisualization
 from app.tool.chart_visualization.python_execute import NormalPythonExecute
+from app.tool.terminate import Terminate
+from app.tool.tool_collection import ToolCollection
 
 
 class DataAnalysis(ToolCallAgent):
@@ -20,7 +21,10 @@ class DataAnalysis(ToolCallAgent):
     name: str = "Data_Analysis"
     description: str = "An analytical agent that utilizes python and data visualization tools to solve diverse data analysis tasks"
 
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
+    # Formatted per instance so that each run sees its own workspace
+    system_prompt: str = Field(
+        default_factory=lambda: SYSTEM_PROMPT.format(directory=get_workspace())
+    )
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 15000

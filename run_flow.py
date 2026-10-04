@@ -1,23 +1,21 @@
 import asyncio
 import time
 
-from app.agent.data_analysis import DataAnalysis
-from app.agent.manus import Manus
-from app.config import config
+from app.agent.registry import available_agents
 from app.flow.flow_factory import FlowFactory, FlowType
 from app.logger import logger
 
 
+FLOW_TIMEOUT_SECONDS = 3600
+
+
 async def run_flow():
-    agents = {
-        "manus": Manus(),
-    }
-    if config.run_flow_config.use_data_analysis_agent:
-        agents["data_analysis"] = DataAnalysis()
+    # Every available team agent; each plan step runs on a fresh agent of its type
+    agents = {spec.key: spec for spec in available_agents(team_only=True)}
     try:
         prompt = input("Enter your prompt: ")
 
-        if prompt.strip().isspace() or not prompt:
+        if not prompt.strip():
             logger.warning("Empty prompt provided.")
             return
 
@@ -29,14 +27,12 @@ async def run_flow():
 
         try:
             start_time = time.time()
-            result = await asyncio.wait_for(
-                flow.execute(prompt),
-                timeout=3600,  # 60 minute timeout for the entire execution
-            )
+            # The final answer is streamed to the terminal while it is generated
+            async with asyncio.timeout(FLOW_TIMEOUT_SECONDS):
+                await flow.execute(prompt)
             elapsed_time = time.time() - start_time
             logger.info(f"Request processed in {elapsed_time:.2f} seconds")
-            logger.info(result)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Request processing timed out after 1 hour")
             logger.info(
                 "Operation terminated due to timeout. Please try a simpler request."

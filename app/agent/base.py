@@ -1,13 +1,20 @@
+import asyncio
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
+from app.context import current_run, emit
 from app.llm import LLM
 from app.logger import logger
-from app.sandbox.client import SANDBOX_CLIENT
 from app.schema import ROLE_TYPE, AgentState, Memory, Message
+
+
+STUCK_PROMPT = (
+    "Observed duplicate responses. Consider new strategies and avoid repeating "
+    "ineffective paths already attempted."
+)
 
 
 class BaseAgent(BaseModel, ABC):
@@ -15,11 +22,17 @@ class BaseAgent(BaseModel, ABC):
 
     Provides foundational functionality for state transitions, memory management,
     and a step-based execution loop. Subclasses must implement the `step` method.
+
+    While a run is active the loop reports ``agent.started``, ``agent.step``,
+    ``agent.stuck`` and ``agent.finished`` events through :func:`app.context.emit`.
     """
 
     # Core attributes
     name: str = Field(..., description="Unique name of the agent")
     description: Optional[str] = Field(None, description="Optional agent description")
+    title: Optional[str] = Field(
+        None, description="Display name reported in events (defaults to the name)"
+    )
 
     # Prompts
     system_prompt: Optional[str] = Field(
@@ -42,9 +55,13 @@ class BaseAgent(BaseModel, ABC):
 
     duplicate_threshold: int = 2
 
-    class Config:
-        arbitrary_types_allowed = True
-        extra = "allow"  # Allow extra fields for flexibility in subclasses
+    # Why the current run finished (reported in the agent.finished event)
+    _finish_reason: Optional[str] = PrivateAttr(default=None)
+    # Strategy hint injected into the next step only, after a stuck state was detected
+    _stuck_hint: Optional[str] = PrivateAttr(default=None)
+
+    # Allow extra fields for flexibility in subclasses
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     @model_validator(mode="after")
     def initialize_agent(self) -> "BaseAgent":
@@ -113,6 +130,16 @@ class BaseAgent(BaseModel, ABC):
         kwargs = {"base64_image": base64_image, **(kwargs if role == "tool" else {})}
         self.memory.add_message(message_map[role](content, **kwargs))
 
+    @property
+    def finish_reason(self) -> Optional[str]:
+        """Why the last run ended: terminated, no_action, max_steps, error or cancelled."""
+        return self._finish_reason
+
+    def finish(self, reason: str) -> None:
+        """End the current run after this step; ``reason`` is reported in events."""
+        self.state = AgentState.FINISHED
+        self._finish_reason = reason
+
     async def run(self, request: Optional[str] = None) -> str:
         """Execute the agent's main loop asynchronously.
 
@@ -131,26 +158,67 @@ class BaseAgent(BaseModel, ABC):
         if request:
             self.update_memory("user", request)
 
+        self.current_step = 0
+        self._finish_reason = None
+        self._stuck_hint = None
+        emit(
+            "agent.started",
+            agent=self.name,
+            title=self.title or self.name,
+            max_steps=self.max_steps,
+        )
+
         results: List[str] = []
-        async with self.state_context(AgentState.RUNNING):
-            while (
-                self.current_step < self.max_steps and self.state != AgentState.FINISHED
-            ):
-                self.current_step += 1
-                logger.info(f"Executing step {self.current_step}/{self.max_steps}")
-                step_result = await self.step()
+        reason = "max_steps"
+        try:
+            async with self.state_context(AgentState.RUNNING):
+                while (
+                    self.current_step < self.max_steps
+                    and self.state != AgentState.FINISHED
+                ):
+                    self.current_step += 1
+                    logger.info(
+                        f"{self.name}: executing step {self.current_step}/{self.max_steps}"
+                    )
+                    emit(
+                        "agent.step",
+                        agent=self.name,
+                        step=self.current_step,
+                        max_steps=self.max_steps,
+                    )
+                    step_result = await self.step()
 
-                # Check for stuck state
-                if self.is_stuck():
-                    self.handle_stuck_state()
+                    # Check for stuck state
+                    if self.is_stuck():
+                        self.handle_stuck_state()
 
-                results.append(f"Step {self.current_step}: {step_result}")
+                    results.append(f"Step {self.current_step}: {step_result}")
 
-            if self.current_step >= self.max_steps:
-                self.current_step = 0
-                self.state = AgentState.IDLE
-                results.append(f"Terminated: Reached max steps ({self.max_steps})")
-        await SANDBOX_CLIENT.cleanup()
+                if self.state == AgentState.FINISHED:
+                    reason = self._finish_reason or "terminated"
+                else:
+                    results.append(f"Terminated: Reached max steps ({self.max_steps})")
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
+        except Exception:
+            reason = "error"
+            raise
+        finally:
+            self._finish_reason = reason
+            emit(
+                "agent.finished",
+                agent=self.name,
+                steps=self.current_step,
+                reason=reason,
+            )
+
+        # The docker sandbox client is process-global: only the single-user CLI may
+        # tear it down after a run (web runs would destroy each other's sandbox).
+        if current_run() is None:
+            from app.sandbox.client import SANDBOX_CLIENT
+
+            await SANDBOX_CLIENT.cleanup()
         return "\n".join(results) if results else "No steps executed"
 
     @abstractmethod
@@ -161,28 +229,40 @@ class BaseAgent(BaseModel, ABC):
         """
 
     def handle_stuck_state(self):
-        """Handle stuck state by adding a prompt to change strategy"""
-        stuck_prompt = "\
-        Observed duplicate responses. Consider new strategies and avoid repeating ineffective paths already attempted."
-        self.next_step_prompt = f"{stuck_prompt}\n{self.next_step_prompt}"
-        logger.warning(f"Agent detected stuck state. Added prompt: {stuck_prompt}")
+        """Ask the model to change strategy on its next step (one-shot hint)."""
+        self._stuck_hint = STUCK_PROMPT
+        logger.warning(f"Agent {self.name} detected stuck state, adding a hint")
+        emit("agent.stuck", agent=self.name, step=self.current_step)
+
+    def consume_stuck_hint(self) -> Optional[str]:
+        """Return the pending stuck hint (if any) and clear it."""
+        hint, self._stuck_hint = self._stuck_hint, None
+        return hint
+
+    @staticmethod
+    def _response_signature(message: Message) -> Optional[Tuple]:
+        """What an assistant message said and did (None when it is empty)."""
+        calls = tuple(
+            (call.function.name, call.function.arguments)
+            for call in message.tool_calls or []
+        )
+        if not message.content and not calls:
+            return None
+        return message.content or "", calls
 
     def is_stuck(self) -> bool:
-        """Check if the agent is stuck in a loop by detecting duplicate content"""
-        if len(self.memory.messages) < 2:
+        """Check if the latest assistant response repeats earlier ones verbatim."""
+        responses = [m for m in self.memory.messages if m.role == "assistant"]
+        if len(responses) < 2:
             return False
 
-        last_message = self.memory.messages[-1]
-        if not last_message.content:
+        last = self._response_signature(responses[-1])
+        if last is None:
             return False
 
-        # Count identical content occurrences
         duplicate_count = sum(
-            1
-            for msg in reversed(self.memory.messages[:-1])
-            if msg.role == "assistant" and msg.content == last_message.content
+            1 for msg in responses[:-1] if self._response_signature(msg) == last
         )
-
         return duplicate_count >= self.duplicate_threshold
 
     @property

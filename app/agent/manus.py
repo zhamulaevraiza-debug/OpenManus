@@ -5,14 +5,17 @@ from pydantic import Field, model_validator
 from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
 from app.config import config
+from app.context import get_workspace
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
 from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
+from app.tool.terminate import Terminate
+from app.tool.tool_collection import ToolCollection
+from app.tool.web_search import WebSearch
 
 
 class Manus(ToolCallAgent):
@@ -21,7 +24,10 @@ class Manus(ToolCallAgent):
     name: str = "Manus"
     description: str = "A versatile agent that can solve various tasks using multiple tools including MCP-based tools"
 
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
+    # Formatted per instance so that each run sees its own workspace
+    system_prompt: str = Field(
+        default_factory=lambda: SYSTEM_PROMPT.format(directory=get_workspace())
+    )
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 10000
@@ -36,6 +42,7 @@ class Manus(ToolCallAgent):
             PythonExecute(),
             BrowserUseTool(),
             StrReplaceEditor(),
+            WebSearch(),
             AskHuman(),
             Terminate(),
         )
@@ -129,13 +136,14 @@ class Manus(ToolCallAgent):
         self.available_tools.add_tools(*self.mcp_clients.tools)
 
     async def cleanup(self):
-        """Clean up Manus agent resources."""
-        if self.browser_context_helper:
-            await self.browser_context_helper.cleanup_browser()
-        # Disconnect from all MCP servers only if we were initialized
-        if self._initialized:
-            await self.disconnect_mcp_server()
-            self._initialized = False
+        """Release tool resources (browser, processes) and MCP connections."""
+        try:
+            await super().cleanup()
+        finally:
+            # Disconnect from all MCP servers only if we were initialized
+            if self._initialized:
+                self._initialized = False
+                await self.disconnect_mcp_server()
 
     async def think(self) -> bool:
         """Process current state and decide next actions with appropriate context."""
@@ -144,22 +152,11 @@ class Manus(ToolCallAgent):
             self._initialized = True
 
         original_prompt = self.next_step_prompt
-        recent_messages = self.memory.messages[-3:] if self.memory.messages else []
-        browser_in_use = any(
-            tc.function.name == BrowserUseTool().name
-            for msg in recent_messages
-            if msg.tool_calls
-            for tc in msg.tool_calls
+        self.next_step_prompt = await self.browser_context_helper.next_step_prompt_for(
+            original_prompt
         )
-
-        if browser_in_use:
-            self.next_step_prompt = (
-                await self.browser_context_helper.format_next_step_prompt()
-            )
-
-        result = await super().think()
-
-        # Restore original prompt
-        self.next_step_prompt = original_prompt
-
-        return result
+        try:
+            return await super().think()
+        finally:
+            # Restore original prompt
+            self.next_step_prompt = original_prompt

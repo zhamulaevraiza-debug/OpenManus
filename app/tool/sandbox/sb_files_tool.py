@@ -1,7 +1,7 @@
 import asyncio
 from typing import Optional, TypeVar
 
-from pydantic import Field
+from pydantic import PrivateAttr
 
 from app.daytona.tool_base import Sandbox, SandboxToolsBase
 from app.tool.base import ToolResult
@@ -71,9 +71,7 @@ class SandboxFilesTool(SandboxToolsBase):
             "delete_file": ["file_path"],
         },
     }
-    SNIPPET_LINES: int = Field(default=4, exclude=True)
-    # workspace_path: str = Field(default="/workspace", exclude=True)
-    # sandbox: Optional[Sandbox] = Field(default=None, exclude=True)
+    _lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
     def __init__(
         self, sandbox: Optional[Sandbox] = None, thread_id: Optional[str] = None, **data
@@ -91,10 +89,14 @@ class SandboxFilesTool(SandboxToolsBase):
         """Check if a file should be excluded based on path, name, or extension"""
         return should_exclude_file(rel_path)
 
-    def _file_exists(self, path: str) -> bool:
+    async def _fs(self, method: str, *args):
+        """Call ``sandbox.fs.<method>`` in a worker thread (the SDK is synchronous)."""
+        return await asyncio.to_thread(getattr(self.sandbox.fs, method), *args)
+
+    async def _file_exists(self, path: str) -> bool:
         """Check if a file exists in the sandbox"""
         try:
-            self.sandbox.fs.get_file_info(path)
+            await self._fs("get_file_info", path)
             return True
         except Exception:
             return False
@@ -106,7 +108,7 @@ class SandboxFilesTool(SandboxToolsBase):
             # Ensure sandbox is initialized
             await self._ensure_sandbox()
 
-            files = self.sandbox.fs.list_files(self.workspace_path)
+            files = await self._fs("list_files", self.workspace_path)
             for file_info in files:
                 rel_path = file_info.name
 
@@ -116,22 +118,22 @@ class SandboxFilesTool(SandboxToolsBase):
 
                 try:
                     full_path = f"{self.workspace_path}/{rel_path}"
-                    content = self.sandbox.fs.download_file(full_path).decode()
+                    content = (await self._fs("download_file", full_path)).decode()
                     files_state[rel_path] = {
                         "content": content,
                         "is_dir": file_info.is_dir,
                         "size": file_info.size,
                         "modified": file_info.mod_time,
                     }
-                except Exception as e:
-                    print(f"Error reading file {rel_path}: {e}")
                 except UnicodeDecodeError:
-                    print(f"Skipping binary file: {rel_path}")
+                    logger.debug(f"Skipping binary file: {rel_path}")
+                except Exception as e:
+                    logger.warning(f"Error reading file {rel_path}: {e}")
 
             return files_state
 
         except Exception as e:
-            print(f"Error getting workspace state: {str(e)}")
+            logger.warning(f"Error getting workspace state: {str(e)}")
             return {}
 
     async def execute(
@@ -156,7 +158,7 @@ class SandboxFilesTool(SandboxToolsBase):
         Returns:
             ToolResult with the operation's output or error
         """
-        async with asyncio.Lock():
+        async with self._lock:
             try:
                 # File creation
                 if action == "create_file":
@@ -170,7 +172,7 @@ class SandboxFilesTool(SandboxToolsBase):
 
                 # String replacement
                 elif action == "str_replace":
-                    if not file_path or not old_str or not new_str:
+                    if not file_path or not old_str or new_str is None:
                         return self.fail_response(
                             "file_path, old_str, and new_str are required for str_replace"
                         )
@@ -211,7 +213,7 @@ class SandboxFilesTool(SandboxToolsBase):
 
             file_path = self.clean_path(file_path)
             full_path = f"{self.workspace_path}/{file_path}"
-            if self._file_exists(full_path):
+            if await self._file_exists(full_path):
                 return self.fail_response(
                     f"File '{file_path}' already exists. Use full_file_rewrite to modify existing files."
                 )
@@ -219,18 +221,20 @@ class SandboxFilesTool(SandboxToolsBase):
             # Create parent directories if needed
             parent_dir = "/".join(full_path.split("/")[:-1])
             if parent_dir:
-                self.sandbox.fs.create_folder(parent_dir, "755")
+                await self._fs("create_folder", parent_dir, "755")
 
             # Write the file content
-            self.sandbox.fs.upload_file(file_contents.encode(), full_path)
-            self.sandbox.fs.set_file_permissions(full_path, permissions)
+            await self._fs("upload_file", file_contents.encode(), full_path)
+            await self._fs("set_file_permissions", full_path, permissions)
 
             message = f"File '{file_path}' created successfully."
 
             # Check if index.html was created and add 8080 server info (only in root workspace)
             if file_path.lower() == "index.html":
                 try:
-                    website_link = self.sandbox.get_preview_link(8080)
+                    website_link = await asyncio.to_thread(
+                        self.sandbox.get_preview_link, 8080
+                    )
                     website_url = (
                         website_link.url
                         if hasattr(website_link, "url")
@@ -257,10 +261,10 @@ class SandboxFilesTool(SandboxToolsBase):
 
             file_path = self.clean_path(file_path)
             full_path = f"{self.workspace_path}/{file_path}"
-            if not self._file_exists(full_path):
+            if not await self._file_exists(full_path):
                 return self.fail_response(f"File '{file_path}' does not exist")
 
-            content = self.sandbox.fs.download_file(full_path).decode()
+            content = (await self._fs("download_file", full_path)).decode()
             old_str = old_str.expandtabs()
             new_str = new_str.expandtabs()
 
@@ -279,17 +283,9 @@ class SandboxFilesTool(SandboxToolsBase):
 
             # Perform replacement
             new_content = content.replace(old_str, new_str)
-            self.sandbox.fs.upload_file(new_content.encode(), full_path)
+            await self._fs("upload_file", new_content.encode(), full_path)
 
-            # Show snippet around the edit
-            replacement_line = content.split(old_str)[0].count("\n")
-            start_line = max(0, replacement_line - self.SNIPPET_LINES)
-            end_line = replacement_line + self.SNIPPET_LINES + new_str.count("\n")
-            snippet = "\n".join(new_content.split("\n")[start_line : end_line + 1])
-
-            message = f"Replacement successful."
-
-            return self.success_response(message)
+            return self.success_response("Replacement successful.")
 
         except Exception as e:
             return self.fail_response(f"Error replacing string: {str(e)}")
@@ -304,20 +300,22 @@ class SandboxFilesTool(SandboxToolsBase):
 
             file_path = self.clean_path(file_path)
             full_path = f"{self.workspace_path}/{file_path}"
-            if not self._file_exists(full_path):
+            if not await self._file_exists(full_path):
                 return self.fail_response(
                     f"File '{file_path}' does not exist. Use create_file to create a new file."
                 )
 
-            self.sandbox.fs.upload_file(file_contents.encode(), full_path)
-            self.sandbox.fs.set_file_permissions(full_path, permissions)
+            await self._fs("upload_file", file_contents.encode(), full_path)
+            await self._fs("set_file_permissions", full_path, permissions)
 
             message = f"File '{file_path}' completely rewritten successfully."
 
             # Check if index.html was rewritten and add 8080 server info (only in root workspace)
             if file_path.lower() == "index.html":
                 try:
-                    website_link = self.sandbox.get_preview_link(8080)
+                    website_link = await asyncio.to_thread(
+                        self.sandbox.get_preview_link, 8080
+                    )
                     website_url = (
                         website_link.url
                         if hasattr(website_link, "url")
@@ -342,10 +340,10 @@ class SandboxFilesTool(SandboxToolsBase):
 
             file_path = self.clean_path(file_path)
             full_path = f"{self.workspace_path}/{file_path}"
-            if not self._file_exists(full_path):
+            if not await self._file_exists(full_path):
                 return self.fail_response(f"File '{file_path}' does not exist")
 
-            self.sandbox.fs.delete_file(full_path)
+            await self._fs("delete_file", full_path)
             return self.success_response(f"File '{file_path}' deleted successfully.")
         except Exception as e:
             return self.fail_response(f"Error deleting file: {str(e)}")

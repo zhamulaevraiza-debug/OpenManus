@@ -1,13 +1,16 @@
 """File and directory manipulation tool with sandbox support."""
 
+import posixpath
+import shlex
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, DefaultDict, List, Literal, Optional, get_args
 
+from pydantic import PrivateAttr
+
 from app.config import config
+from app.context import resolve_in_workspace
 from app.exceptions import ToolError
-from app.tool import BaseTool
-from app.tool.base import CLIResult, ToolResult
+from app.tool.base import BaseTool, CLIResult, ToolResult
 from app.tool.file_operators import (
     FileOperator,
     LocalFileOperator,
@@ -36,6 +39,7 @@ TRUNCATED_MESSAGE: str = (
 # Tool description
 _STR_REPLACE_EDITOR_DESCRIPTION = """Custom editing tool for viewing, creating and editing files
 * State is persistent across command calls and discussions with the user
+* Relative paths are resolved against the workspace directory; absolute paths are accepted when they point inside the workspace
 * If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
 * The `create` command cannot be used if the specified `path` already exists as a file
 * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
@@ -71,7 +75,7 @@ class StrReplaceEditor(BaseTool):
                 "type": "string",
             },
             "path": {
-                "description": "Absolute path to file or directory.",
+                "description": "Path to file or directory, relative to the workspace (absolute paths inside the workspace are also accepted).",
                 "type": "string",
             },
             "file_text": {
@@ -98,18 +102,43 @@ class StrReplaceEditor(BaseTool):
         },
         "required": ["command", "path"],
     }
-    _file_history: DefaultDict[PathLike, List[str]] = defaultdict(list)
-    _local_operator: LocalFileOperator = LocalFileOperator()
-    _sandbox_operator: SandboxFileOperator = SandboxFileOperator()
+    _file_history: DefaultDict[str, List[str]] = PrivateAttr(
+        default_factory=lambda: defaultdict(list)
+    )
+    _local_operator: LocalFileOperator = PrivateAttr(default_factory=LocalFileOperator)
+    _sandbox_operator: Optional[SandboxFileOperator] = PrivateAttr(default=None)
 
-    # def _get_operator(self, use_sandbox: bool) -> FileOperator:
+    @staticmethod
+    def _use_sandbox() -> bool:
+        return bool(config.sandbox and config.sandbox.use_sandbox)
+
     def _get_operator(self) -> FileOperator:
         """Get the appropriate file operator based on execution mode."""
-        return (
-            self._sandbox_operator
-            if config.sandbox.use_sandbox
-            else self._local_operator
-        )
+        if not self._use_sandbox():
+            return self._local_operator
+        if self._sandbox_operator is None:
+            self._sandbox_operator = SandboxFileOperator()
+        return self._sandbox_operator
+
+    def _resolve_path(self, path: str) -> str:
+        """Resolve ``path`` for the active operator.
+
+        Locally, relative paths are resolved against the workspace and the result must
+        stay inside it (symlinks are followed). In the Docker sandbox, relative paths
+        are resolved against the container work directory.
+        """
+        if not path or not str(path).strip():
+            raise ToolError("Parameter `path` must not be empty.")
+        if self._use_sandbox():
+            work_dir = config.sandbox.work_dir
+            return posixpath.normpath(posixpath.join(work_dir, str(path)))
+        return str(resolve_in_workspace(path))
+
+    async def cleanup(self) -> None:
+        """Remove the sandbox container created by this editor, if any."""
+        if self._sandbox_operator is not None:
+            operator, self._sandbox_operator = self._sandbox_operator, None
+            await operator.cleanup()
 
     async def execute(
         self,
@@ -127,8 +156,9 @@ class StrReplaceEditor(BaseTool):
         # Get the appropriate file operator
         operator = self._get_operator()
 
-        # Validate path and command combination
-        await self.validate_path(command, Path(path), operator)
+        # Resolve (and confine) the path, then validate the command combination
+        path = self._resolve_path(path)
+        await self.validate_path(command, path, operator)
 
         # Execute the appropriate command
         if command == "view":
@@ -164,13 +194,9 @@ class StrReplaceEditor(BaseTool):
         return str(result)
 
     async def validate_path(
-        self, command: str, path: Path, operator: FileOperator
+        self, command: str, path: PathLike, operator: FileOperator
     ) -> None:
         """Validate path and command combination based on execution environment."""
-        # Check if path is absolute
-        if not path.is_absolute():
-            raise ToolError(f"The path {path} is not an absolute path")
-
         # Only check if path exists for non-create commands
         if command != "create":
             if not await operator.exists(path):
@@ -218,7 +244,7 @@ class StrReplaceEditor(BaseTool):
     @staticmethod
     async def _view_directory(path: PathLike, operator: FileOperator) -> CLIResult:
         """Display directory contents."""
-        find_cmd = f"find {path} -maxdepth 2 -not -path '*/\\.*'"
+        find_cmd = f"find {shlex.quote(str(path))} -maxdepth 2 -not -path '*/\\.*'"
 
         # Execute command using the operator
         returncode, stdout, stderr = await operator.run_command(find_cmd)

@@ -1,7 +1,12 @@
+import os
+
 import pytest
 import pytest_asyncio
 
 from app.sandbox.core.sandbox import DockerSandbox, SandboxSettings
+
+
+pytestmark = [pytest.mark.docker, pytest.mark.asyncio(loop_scope="module")]
 
 
 @pytest.fixture(scope="module")
@@ -16,7 +21,7 @@ def sandbox_config():
     )
 
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def sandbox(sandbox_config):
     """Creates and manages a test sandbox instance."""
     sandbox = DockerSandbox(sandbox_config)
@@ -27,14 +32,12 @@ async def sandbox(sandbox_config):
         await sandbox.cleanup()
 
 
-@pytest.mark.asyncio
 async def test_sandbox_working_directory(sandbox):
     """Tests sandbox working directory configuration."""
     result = await sandbox.terminal.run_command("pwd")
     assert result.strip() == "/workspace"
 
 
-@pytest.mark.asyncio
 async def test_sandbox_file_operations(sandbox):
     """Tests sandbox file read/write operations."""
     # Test file writing
@@ -46,7 +49,6 @@ async def test_sandbox_file_operations(sandbox):
     assert content.strip() == test_content
 
 
-@pytest.mark.asyncio
 async def test_sandbox_python_execution(sandbox):
     """Tests Python code execution in sandbox."""
     # Write test file
@@ -66,7 +68,6 @@ with open('/workspace/test.txt') as f:
     assert "Hello from file!" in result
 
 
-@pytest.mark.asyncio
 async def test_sandbox_file_persistence(sandbox):
     """Tests file persistence in sandbox."""
     # Create multiple files
@@ -86,12 +87,11 @@ async def test_sandbox_file_persistence(sandbox):
         assert content.strip() == expected_content
 
 
-@pytest.mark.asyncio
 async def test_sandbox_python_environment(sandbox):
     """Tests Python environment configuration."""
     # Test Python version
     result = await sandbox.terminal.run_command("python3 --version")
-    assert "Python 3.10" in result
+    assert "Python 3.12" in result
 
     # Test basic module imports
     python_code = """
@@ -105,7 +105,10 @@ print("Python is working!")
     assert "Python is working!" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.environ.get("OPENMANUS_TEST_NETWORK"),
+    reason="needs internet access from containers (set OPENMANUS_TEST_NETWORK=1)",
+)
 async def test_sandbox_network_access(sandbox):
     """Tests sandbox network access."""
     if not sandbox.config.network_enabled:
@@ -117,7 +120,6 @@ async def test_sandbox_network_access(sandbox):
     assert "HTTP/2 200" in result
 
 
-@pytest.mark.asyncio
 async def test_sandbox_cleanup(sandbox_config):
     """Tests sandbox cleanup process."""
     sandbox = DockerSandbox(sandbox_config)
@@ -137,7 +139,18 @@ async def test_sandbox_cleanup(sandbox_config):
     assert not any(c.id == container_id for c in containers)
 
 
-@pytest.mark.asyncio
+async def test_sandbox_cleanup_removes_host_workdir(sandbox_config):
+    """The temporary host directory bound to the work dir is deleted on cleanup."""
+    sandbox = DockerSandbox(sandbox_config)
+    await sandbox.create()
+    host_dirs = list(sandbox._host_dirs)
+    assert host_dirs and all(os.path.isdir(path) for path in host_dirs)
+
+    await sandbox.cleanup()
+
+    assert not any(os.path.exists(path) for path in host_dirs)
+
+
 async def test_sandbox_error_handling():
     """Tests error handling with invalid configuration."""
     # Test invalid configuration

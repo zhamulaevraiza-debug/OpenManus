@@ -7,6 +7,7 @@ allowing interactive command execution with timeout control.
 
 import asyncio
 import re
+import secrets
 import socket
 from typing import Dict, Optional, Tuple, Union
 
@@ -15,18 +16,30 @@ from docker import APIClient
 from docker.errors import APIError
 from docker.models.containers import Container
 
+from app.logger import logger
+
+
+PROMPT = b"$ "
+STARTUP_TIMEOUT_SECONDS = 30
+INTERRUPT_TIMEOUT_SECONDS = 5
+_EXIT_CODE_MARKER = "__OPENMANUS_RC__"
+_EXIT_CODE_LINE = re.compile(rb"^" + _EXIT_CODE_MARKER.encode() + rb"(\d+)$")
+
 
 class DockerSession:
-    def __init__(self, container_id: str) -> None:
+    def __init__(self, container_id: str, api: Optional[APIClient] = None) -> None:
         """Initializes a Docker session.
 
         Args:
             container_id: ID of the Docker container.
+            api: Low-level Docker API client (default: from the environment, so
+                DOCKER_HOST and friends are honoured).
         """
-        self.api = APIClient()
+        self.api = api or docker.from_env().api
         self.container_id = container_id
         self.exec_id = None
         self.socket = None
+        self._lock = asyncio.Lock()
 
     async def create(self, working_dir: str, env_vars: Dict[str, str]) -> None:
         """Creates an interactive session with the container.
@@ -36,7 +49,7 @@ class DockerSession:
             env_vars: Environment variables to set.
 
         Raises:
-            RuntimeError: If socket connection fails.
+            RuntimeError: If socket connection fails or the shell does not start.
         """
         startup_command = [
             "bash",
@@ -47,7 +60,8 @@ class DockerSession:
             "exec bash --norc --noprofile",
         ]
 
-        exec_data = self.api.exec_create(
+        exec_data = await asyncio.to_thread(
+            self.api.exec_create,
             self.container_id,
             startup_command,
             stdin=True,
@@ -60,8 +74,13 @@ class DockerSession:
         )
         self.exec_id = exec_data["Id"]
 
-        socket_data = self.api.exec_start(
-            self.exec_id, socket=True, tty=True, stream=True, demux=True
+        socket_data = await asyncio.to_thread(
+            self.api.exec_start,
+            self.exec_id,
+            socket=True,
+            tty=True,
+            stream=True,
+            demux=True,
         )
 
         if hasattr(socket_data, "_sock"):
@@ -70,7 +89,10 @@ class DockerSession:
         else:
             raise RuntimeError("Failed to get socket connection")
 
-        await self._read_until_prompt()
+        try:
+            await asyncio.wait_for(self._read_until_prompt(), STARTUP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Timed out waiting for the container shell") from None
 
     async def close(self) -> None:
         """Cleans up session resources.
@@ -86,13 +108,13 @@ class DockerSession:
                     self.socket.sendall(b"exit\n")
                     # Allow time for command execution
                     await asyncio.sleep(0.1)
-                except:
+                except OSError:
                     pass  # Ignore sending errors, continue cleanup
 
                 # Close socket connection
                 try:
                     self.socket.shutdown(socket.SHUT_RDWR)
-                except:
+                except OSError:
                     pass  # Some platforms may not support shutdown
 
                 self.socket.close()
@@ -101,18 +123,32 @@ class DockerSession:
             if self.exec_id:
                 try:
                     # Check exec instance status
-                    exec_inspect = self.api.exec_inspect(self.exec_id)
+                    exec_inspect = await asyncio.to_thread(
+                        self.api.exec_inspect, self.exec_id
+                    )
                     if exec_inspect.get("Running", False):
                         # If still running, wait for it to complete
                         await asyncio.sleep(0.5)
-                except:
+                except Exception:
                     pass  # Ignore inspection errors, continue cleanup
 
                 self.exec_id = None
 
         except Exception as e:
             # Log error but don't raise, ensure cleanup continues
-            print(f"Warning: Error during session cleanup: {e}")
+            logger.warning(f"Error during session cleanup: {e}")
+
+    async def _recv(self) -> bytes:
+        """Receive a chunk from the non-blocking socket; raises on EOF."""
+        while True:
+            try:
+                chunk = self.socket.recv(4096)
+            except BlockingIOError:
+                await asyncio.sleep(0.05)
+                continue
+            if not chunk:
+                raise ConnectionError("Container shell closed the connection")
+            return chunk
 
     async def _read_until_prompt(self) -> str:
         """Reads output until prompt is found.
@@ -121,20 +157,38 @@ class DockerSession:
             String containing output up to the prompt.
 
         Raises:
-            socket.error: If socket communication fails.
+            ConnectionError: If the shell connection reaches EOF.
         """
         buffer = b""
-        while b"$ " not in buffer:
-            try:
-                chunk = self.socket.recv(4096)
-                if chunk:
-                    buffer += chunk
-            except socket.error as e:
-                if e.errno == socket.EWOULDBLOCK:
-                    await asyncio.sleep(0.1)
-                    continue
-                raise
-        return buffer.decode("utf-8")
+        while PROMPT not in buffer:
+            buffer += await self._recv()
+        return buffer.decode("utf-8", errors="replace")
+
+    async def _interrupt(self) -> None:
+        """Interrupt the running command (Ctrl-C) and resynchronise the stream.
+
+        A unique token is echoed after the interrupt and everything up to it (and
+        the following prompt) is discarded, so later commands read clean output.
+        """
+        token = f"__OPENMANUS_SYNC_{secrets.token_hex(4)}__".encode()
+        try:
+            self.socket.sendall(b"\x03")
+            await asyncio.sleep(0.1)
+            self.socket.sendall(b"echo " + token + b"\n")
+            await asyncio.wait_for(self._drain_until(token), INTERRUPT_TIMEOUT_SECONDS)
+        except Exception as e:
+            logger.warning(f"Could not interrupt the timed out command: {e}")
+
+    async def _drain_until(self, token: bytes) -> None:
+        buffer = b""
+        seen = False
+        while True:
+            buffer += await self._recv()
+            lines = buffer.split(b"\n")
+            buffer = lines[-1]
+            seen = seen or any(line.strip() == token for line in lines[:-1])
+            if seen and buffer.endswith(PROMPT):
+                return
 
     async def execute(self, command: str, timeout: Optional[int] = None) -> str:
         """Executes a command and returns cleaned output.
@@ -153,67 +207,69 @@ class DockerSession:
         if not self.socket:
             raise RuntimeError("Session not initialized")
 
-        try:
+        async with self._lock:
             # Sanitize command to prevent shell injection
             sanitized_command = self._sanitize_command(command)
-            full_command = f"{sanitized_command}\necho $?\n"
-            self.socket.sendall(full_command.encode())
-
-            async def read_output() -> str:
-                buffer = b""
-                result_lines = []
-                command_sent = False
-
-                while True:
-                    try:
-                        chunk = self.socket.recv(4096)
-                        if not chunk:
-                            break
-
-                        buffer += chunk
-                        lines = buffer.split(b"\n")
-
-                        buffer = lines[-1]
-                        lines = lines[:-1]
-
-                        for line in lines:
-                            line = line.rstrip(b"\r")
-
-                            if not command_sent:
-                                command_sent = True
-                                continue
-
-                            if line.strip() == b"echo $?" or line.strip().isdigit():
-                                continue
-
-                            if line.strip():
-                                result_lines.append(line)
-
-                        if buffer.endswith(b"$ "):
-                            break
-
-                    except socket.error as e:
-                        if e.errno == socket.EWOULDBLOCK:
-                            await asyncio.sleep(0.1)
-                            continue
-                        raise
-
-                output = b"\n".join(result_lines).decode("utf-8")
-                output = re.sub(r"\n\$ echo \$\$?.*$", "", output)
-
-                return output
-
-            if timeout:
-                result = await asyncio.wait_for(read_output(), timeout)
-            else:
-                result = await read_output()
+            full_command = f"{sanitized_command}\necho {_EXIT_CODE_MARKER}$?\n"
+            try:
+                self.socket.sendall(full_command.encode())
+                if timeout:
+                    result = await asyncio.wait_for(self._read_output(), timeout)
+                else:
+                    result = await self._read_output()
+            except asyncio.TimeoutError:
+                await self._interrupt()
+                raise TimeoutError(
+                    f"Command execution timed out after {timeout} seconds"
+                ) from None
+            except Exception as e:
+                raise RuntimeError(f"Failed to execute command: {e}") from e
 
             return result.strip()
 
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"Command execution timed out after {timeout} seconds")
-        except Exception as e:
-            raise RuntimeError(f"Failed to execute command: {e}")
+    async def _read_output(self) -> str:
+        """Collect the output of one command up to the prompt after its exit code.
+
+        The exit code is echoed with a marker (so numeric output lines are kept);
+        the shell's echo of the typed command lines is dropped.
+        """
+        buffer = b""
+        result_lines = []
+        command_echo_skipped = False
+        exit_code_seen = False
+        echo_line = f"echo {_EXIT_CODE_MARKER}$?".encode()
+
+        while True:
+            buffer += await self._recv()
+            lines = buffer.split(b"\n")
+            buffer = lines[-1]
+
+            for line in lines[:-1]:
+                line = line.rstrip(b"\r")
+
+                if not command_echo_skipped:
+                    command_echo_skipped = True
+                    continue
+
+                stripped = line.strip()
+                if _EXIT_CODE_LINE.match(stripped):
+                    exit_code_seen = True
+                    continue
+                if stripped.endswith(echo_line):
+                    # Output without a trailing newline shares the line with the
+                    # prompt and the echoed exit-code command.
+                    line = line[: line.rfind(echo_line)]
+                    if line.endswith(PROMPT):
+                        line = line[: -len(PROMPT)]
+                    stripped = line.strip()
+
+                if stripped:
+                    result_lines.append(line)
+
+            if exit_code_seen and buffer.endswith(PROMPT):
+                break
+
+        return b"\n".join(result_lines).decode("utf-8", errors="replace")
 
     def _sanitize_command(self, command: str) -> str:
         """Sanitizes the command string to prevent shell injection.
@@ -255,6 +311,7 @@ class AsyncDockerizedTerminal:
         working_dir: str = "/workspace",
         env_vars: Optional[Dict[str, str]] = None,
         default_timeout: int = 60,
+        client: Optional[docker.DockerClient] = None,
     ) -> None:
         """Initializes an asynchronous terminal for Docker containers.
 
@@ -263,8 +320,9 @@ class AsyncDockerizedTerminal:
             working_dir: Working directory inside the container.
             env_vars: Environment variables to set.
             default_timeout: Default command execution timeout in seconds.
+            client: Docker client to reuse (default: from the environment).
         """
-        self.client = docker.from_env()
+        self.client = client or docker.from_env()
         self.container = (
             container
             if isinstance(container, Container)
@@ -285,7 +343,7 @@ class AsyncDockerizedTerminal:
         """
         await self._ensure_workdir()
 
-        self.session = DockerSession(self.container.id)
+        self.session = DockerSession(self.container.id, api=self.client.api)
         await self.session.create(self.working_dir, self.env_vars)
 
     async def _ensure_workdir(self) -> None:

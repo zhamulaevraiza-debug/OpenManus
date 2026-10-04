@@ -6,11 +6,32 @@ providing fast, precise, and AI-ready data extraction with clean Markdown genera
 """
 
 import asyncio
-from typing import List, Union
-from urllib.parse import urlparse
+from typing import Any, List, Union
 
+from app.context import current_run
 from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
+from app.tool.net_guard import UnsafeURLError, check_url, guard_browser_context
+
+
+# Total budget of page content returned per call, shared by the crawled URLs.
+MAX_TOTAL_CONTENT_CHARS = 20000
+MIN_CONTENT_CHARS_PER_URL = 2000
+MIN_TIMEOUT_SECONDS = 5
+MAX_TIMEOUT_SECONDS = 120
+
+
+async def _guard_page_context(page: Any, context: Any = None, **kwargs: Any) -> Any:
+    """crawl4ai hook: apply the SSRF guard to every browser context it creates."""
+    if context is not None:
+        await guard_browser_context(context)
+    return page
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n... [truncated {len(text) - limit} characters]"
 
 
 class Crawl4aiTool(BaseTool):
@@ -49,7 +70,7 @@ class Crawl4aiTool(BaseTool):
             },
             "bypass_cache": {
                 "type": "boolean",
-                "description": "(optional) Whether to bypass cache and fetch fresh content. Default is false.",
+                "description": "(optional) Whether to bypass cache and fetch fresh content. Default is false (always fresh in the web app).",
                 "default": False,
             },
             "word_count_threshold": {
@@ -85,18 +106,30 @@ class Crawl4aiTool(BaseTool):
         if isinstance(urls, str):
             url_list = [urls]
         else:
-            url_list = urls
+            url_list = list(urls or [])
 
-        # Validate URLs
+        # Validate URLs: only public http(s) addresses may be crawled
         valid_urls = []
+        rejected = []
         for url in url_list:
-            if self._is_valid_url(url):
-                valid_urls.append(url)
-            else:
-                logger.warning(f"Invalid URL skipped: {url}")
+            try:
+                valid_urls.append(await check_url(str(url)))
+            except UnsafeURLError as e:
+                logger.warning(f"URL skipped: {e.message}")
+                rejected.append(
+                    {"url": str(url), "success": False, "error_message": e.message}
+                )
 
         if not valid_urls:
-            return ToolResult(error="No valid URLs provided")
+            reasons = "; ".join(item["error_message"] for item in rejected)
+            return ToolResult(error=f"No valid URLs provided. {reasons}".strip())
+
+        timeout = max(MIN_TIMEOUT_SECONDS, min(int(timeout), MAX_TIMEOUT_SECONDS))
+        content_limit = max(
+            MIN_CONTENT_CHARS_PER_URL, MAX_TOTAL_CONTENT_CHARS // len(valid_urls)
+        )
+        # The crawl4ai cache is shared by all users of the server: never use it there.
+        use_cache = not bypass_cache and current_run() is None
 
         try:
             # Import crawl4ai components
@@ -118,7 +151,7 @@ class Crawl4aiTool(BaseTool):
 
             # Configure crawler settings
             run_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS if bypass_cache else CacheMode.ENABLED,
+                cache_mode=CacheMode.ENABLED if use_cache else CacheMode.BYPASS,
                 word_count_threshold=word_count_threshold,
                 process_iframes=True,
                 remove_overlay_elements=True,
@@ -128,21 +161,33 @@ class Crawl4aiTool(BaseTool):
                 wait_until="domcontentloaded",
             )
 
-            results = []
+            results = list(rejected)
             successful_count = 0
-            failed_count = 0
+            failed_count = len(rejected)
 
             # Process each URL
-            async with AsyncWebCrawler(config=browser_config) as crawler:
+            crawler = AsyncWebCrawler(config=browser_config)
+            crawler.crawler_strategy.set_hook(
+                "on_page_context_created", _guard_page_context
+            )
+            async with crawler:
                 for url in valid_urls:
                     try:
                         logger.info(f"🕷️ Crawling URL: {url}")
-                        start_time = asyncio.get_event_loop().time()
+                        start_time = asyncio.get_running_loop().time()
 
                         result = await crawler.arun(url=url, config=run_config)
 
-                        end_time = asyncio.get_event_loop().time()
+                        end_time = asyncio.get_running_loop().time()
                         execution_time = end_time - start_time
+
+                        final_url = getattr(result, "redirected_url", None) or url
+                        if result.success and final_url != url:
+                            try:
+                                await check_url(final_url)
+                            except UnsafeURLError as e:
+                                result.success = False
+                                result.error_message = e.message
 
                         if result.success:
                             # Count words in markdown
@@ -208,8 +253,8 @@ class Crawl4aiTool(BaseTool):
                         failed_count += 1
 
             # Format output
-            output_lines = [f"🕷️ Crawl4AI Results Summary:"]
-            output_lines.append(f"📊 Total URLs: {len(valid_urls)}")
+            output_lines = ["🕷️ Crawl4AI Results Summary:"]
+            output_lines.append(f"📊 Total URLs: {len(results)}")
             output_lines.append(f"✅ Successful: {successful_count}")
             output_lines.append(f"❌ Failed: {failed_count}")
             output_lines.append("")
@@ -225,11 +270,8 @@ class Crawl4aiTool(BaseTool):
                         output_lines.append(f"   📄 Title: {result['title']}")
 
                     if result.get("markdown"):
-                        # Show first 300 characters of markdown content
-                        content_preview = result["markdown"]
-                        if len(result["markdown"]) > 300:
-                            content_preview += "..."
-                        output_lines.append(f"   📝 Content: {content_preview}")
+                        content = _truncate(str(result["markdown"]), content_limit)
+                        output_lines.append(f"   📝 Content: {content}")
 
                     output_lines.append(
                         f"   📊 Stats: {result.get('word_count', 0)} words, {result.get('links_count', 0)} links, {result.get('images_count', 0)} images"
@@ -240,7 +282,7 @@ class Crawl4aiTool(BaseTool):
                             f"   ⏱️ Time: {result['execution_time']:.2f}s"
                         )
                 else:
-                    output_lines.append(f"   ❌ Status: Failed")
+                    output_lines.append("   ❌ Status: Failed")
                     if result.get("error_message"):
                         output_lines.append(f"   🚫 Error: {result['error_message']}")
 
@@ -256,14 +298,3 @@ class Crawl4aiTool(BaseTool):
             error_msg = f"Crawl4AI execution failed: {str(e)}"
             logger.error(error_msg)
             return ToolResult(error=error_msg)
-
-    def _is_valid_url(self, url: str) -> bool:
-        """Validate if a URL is properly formatted."""
-        try:
-            result = urlparse(url)
-            return all([result.scheme, result.netloc]) and result.scheme in [
-                "http",
-                "https",
-            ]
-        except Exception:
-            return False

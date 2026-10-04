@@ -1,15 +1,19 @@
 import asyncio
 import base64
-import logging
-import os
 import time
-from typing import Dict, Literal, Optional
+import uuid
+from typing import Any, Dict, Literal, Optional
 
-import aiohttp
 from pydantic import Field
 
+from app.context import get_workspace
 from app.daytona.tool_base import Sandbox, SandboxToolsBase
 from app.tool.base import ToolResult
+from app.utils.logger import logger
+
+
+API_PORT = 8000
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 KEYBOARD_KEYS = [
@@ -176,7 +180,8 @@ class ComputerUseTool(SandboxToolsBase):
             "screenshot": [],
         },
     }
-    session: Optional[aiohttp.ClientSession] = Field(default=None, exclude=True)
+    # aiohttp.ClientSession, created on first request (aiohttp is imported lazily)
+    session: Optional[Any] = Field(default=None, exclude=True)
     mouse_x: int = Field(default=0, exclude=True)
     mouse_y: int = Field(default=0, exclude=True)
     api_base_url: Optional[str] = Field(default=None, exclude=True)
@@ -185,22 +190,30 @@ class ComputerUseTool(SandboxToolsBase):
         """Initialize with optional sandbox."""
         super().__init__(**data)
         if sandbox is not None:
-            self._sandbox = sandbox  # 直接操作基类的私有属性
-            self.api_base_url = sandbox.get_preview_link(8000).url
-            logging.info(
-                f"Initialized ComputerUseTool with API URL: {self.api_base_url}"
-            )
+            self._sandbox = sandbox
 
     @classmethod
     def create_with_sandbox(cls, sandbox: Sandbox) -> "ComputerUseTool":
         """Factory method to create a tool with sandbox."""
         return cls(sandbox=sandbox)  # 通过构造函数初始化
 
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def _get_session(self):
         """Get or create aiohttp session for API requests."""
+        import aiohttp
+
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+            )
         return self.session
+
+    async def _get_api_base_url(self) -> str:
+        """Preview URL of the automation API inside the sandbox."""
+        if self.api_base_url is None:
+            sandbox = await self._ensure_sandbox()
+            link = await asyncio.to_thread(sandbox.get_preview_link, API_PORT)
+            self.api_base_url = link.url
+        return self.api_base_url
 
     async def _api_request(
         self, method: str, endpoint: str, data: Optional[Dict] = None
@@ -208,19 +221,30 @@ class ComputerUseTool(SandboxToolsBase):
         """Send request to automation service API."""
         try:
             session = await self._get_session()
-            url = f"{self.api_base_url}/api{endpoint}"
-            logging.debug(f"API request: {method} {url} {data}")
+            url = f"{await self._get_api_base_url()}/api{endpoint}"
+            logger.debug(f"Computer API request: {method} {endpoint}")
             if method.upper() == "GET":
                 async with session.get(url) as response:
                     result = await response.json()
             else:  # POST
                 async with session.post(url, json=data) as response:
                     result = await response.json()
-            logging.debug(f"API response: {result}")
             return result
         except Exception as e:
-            logging.error(f"API request failed: {str(e)}")
+            logger.error(f"Computer API request {endpoint} failed: {str(e)}")
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _save_screenshot(image_b64: str) -> str:
+        """Store a screenshot in the workspace; returns its workspace-relative path."""
+        relative = (
+            f"screenshots/screenshot_{time.strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid.uuid4().hex[:6]}.png"
+        )
+        target = get_workspace() / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(image_b64))
+        return relative
 
     async def execute(
         self,
@@ -443,24 +467,9 @@ class ComputerUseTool(SandboxToolsBase):
                 result = await self._api_request("POST", "/automation/screenshot")
                 if "image" in result:
                     base64_str = result["image"]
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    # Save screenshot to file
-                    screenshots_dir = "screenshots"
-                    if not os.path.exists(screenshots_dir):
-                        os.makedirs(screenshots_dir)
-                    timestamped_filename = os.path.join(
-                        screenshots_dir, f"screenshot_{timestamp}.png"
-                    )
-                    latest_filename = "latest_screenshot.png"
-                    # Decode base64 string and save to file
-                    img_data = base64.b64decode(base64_str)
-                    with open(timestamped_filename, "wb") as f:
-                        f.write(img_data)
-                    # Save a copy as the latest screenshot
-                    with open(latest_filename, "wb") as f:
-                        f.write(img_data)
+                    saved = await asyncio.to_thread(self._save_screenshot, base64_str)
                     return ToolResult(
-                        output=f"Screenshot saved as {timestamped_filename}",
+                        output=f"Screenshot saved as {saved}",
                         base64_image=base64_str,
                     )
                 else:
@@ -474,14 +483,4 @@ class ComputerUseTool(SandboxToolsBase):
         """Clean up resources."""
         if self.session and not self.session.closed:
             await self.session.close()
-            self.session = None
-
-    def __del__(self):
-        """Ensure cleanup on destruction."""
-        if hasattr(self, "session") and self.session is not None:
-            try:
-                asyncio.run(self.cleanup())
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.cleanup())
-                loop.close()
+        self.session = None

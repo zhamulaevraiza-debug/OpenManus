@@ -9,6 +9,9 @@ import pytest_asyncio
 from app.sandbox.core.manager import SandboxManager
 
 
+pytestmark = [pytest.mark.docker, pytest.mark.asyncio]
+
+
 @pytest_asyncio.fixture(scope="function")
 async def manager() -> AsyncGenerator[SandboxManager, None]:
     """Creates a sandbox manager instance.
@@ -36,7 +39,6 @@ def temp_file():
             os.unlink(path)
 
 
-@pytest.mark.asyncio
 async def test_create_sandbox(manager):
     """Tests sandbox creation."""
     # Create default sandbox
@@ -50,7 +52,6 @@ async def test_create_sandbox(manager):
     assert result.strip() == "test"
 
 
-@pytest.mark.asyncio
 async def test_max_sandboxes_limit(manager):
     """Tests maximum sandbox limit enforcement."""
     created_sandboxes = []
@@ -82,14 +83,24 @@ async def test_max_sandboxes_limit(manager):
                 print(f"Failed to cleanup sandbox {sandbox_id}: {e}")
 
 
-@pytest.mark.asyncio
+async def test_concurrent_creation_respects_limit(manager):
+    """Concurrent creations never exceed max_sandboxes and do not deadlock."""
+    results = await asyncio.gather(
+        *(manager.create_sandbox() for _ in range(manager.max_sandboxes + 1)),
+        return_exceptions=True,
+    )
+    created = [r for r in results if isinstance(r, str)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(created) == manager.max_sandboxes
+    assert len(failures) == 1 and "Maximum number of sandboxes" in str(failures[0])
+
+
 async def test_get_nonexistent_sandbox(manager):
     """Tests retrieving a non-existent sandbox."""
     with pytest.raises(KeyError, match="Sandbox .* not found"):
         await manager.get_sandbox("nonexistent-id")
 
 
-@pytest.mark.asyncio
 async def test_sandbox_cleanup(manager):
     """Tests sandbox cleanup functionality."""
     sandbox_id = await manager.create_sandbox()
@@ -100,7 +111,6 @@ async def test_sandbox_cleanup(manager):
     assert sandbox_id not in manager._last_used
 
 
-@pytest.mark.asyncio
 async def test_idle_sandbox_cleanup(manager):
     """Tests automatic cleanup of idle sandboxes."""
     # Set short idle timeout
@@ -117,7 +127,6 @@ async def test_idle_sandbox_cleanup(manager):
     assert sandbox_id not in manager._sandboxes
 
 
-@pytest.mark.asyncio
 async def test_manager_cleanup(manager):
     """Tests manager cleanup functionality."""
     # Create multiple sandboxes

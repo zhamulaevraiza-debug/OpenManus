@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,6 +34,7 @@ HEADERS = {
 
 BING_HOST_URL = "https://www.bing.com"
 BING_SEARCH_URL = "https://www.bing.com/search?q="
+REQUEST_TIMEOUT_SECONDS = 10
 
 
 class BingSearchEngine(WebSearchEngine):
@@ -60,7 +62,7 @@ class BingSearchEngine(WebSearchEngine):
 
         list_result = []
         first = 1
-        next_url = BING_SEARCH_URL + query
+        next_url = BING_SEARCH_URL + quote_plus(query)
 
         while len(list_result) < num_results:
             data, next_url = self._parse_html(
@@ -84,7 +86,7 @@ class BingSearchEngine(WebSearchEngine):
             tuple: (List of SearchItem objects, next page URL or None)
         """
         try:
-            res = self.session.get(url=url)
+            res = self.session.get(url=url, timeout=REQUEST_TIMEOUT_SECONDS)
             res.encoding = "utf-8"
             root = BeautifulSoup(res.text, "lxml")
 

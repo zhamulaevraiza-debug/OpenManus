@@ -1,5 +1,5 @@
 """Collection classes for managing multiple tools."""
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.exceptions import ToolError
 from app.logger import logger
@@ -8,9 +8,6 @@ from app.tool.base import BaseTool, ToolFailure, ToolResult
 
 class ToolCollection:
     """A collection of defined tools."""
-
-    class Config:
-        arbitrary_types_allowed = True
 
     def __init__(self, *tools: BaseTool):
         self.tools = tools
@@ -23,27 +20,16 @@ class ToolCollection:
         return [tool.to_param() for tool in self.tools]
 
     async def execute(
-        self, *, name: str, tool_input: Dict[str, Any] = None
+        self, *, name: str, tool_input: Optional[Dict[str, Any]] = None
     ) -> ToolResult:
+        """Run tool ``name`` with ``tool_input``; ToolErrors become ToolFailures."""
         tool = self.tool_map.get(name)
         if not tool:
             return ToolFailure(error=f"Tool {name} is invalid")
         try:
-            result = await tool(**tool_input)
-            return result
+            return await tool(**(tool_input or {}))
         except ToolError as e:
             return ToolFailure(error=e.message)
-
-    async def execute_all(self) -> List[ToolResult]:
-        """Execute all tools in the collection sequentially."""
-        results = []
-        for tool in self.tools:
-            try:
-                result = await tool()
-                results.append(result)
-            except ToolError as e:
-                results.append(ToolFailure(error=e.message))
-        return results
 
     def get_tool(self, name: str) -> BaseTool:
         return self.tool_map.get(name)

@@ -1,5 +1,7 @@
+import "./nodeEnv";
 import path from "path";
 import fs from "fs";
+import { randomBytes } from "crypto";
 import puppeteer from "puppeteer";
 import VMind, { ChartType, DataTable } from "@visactor/vmind";
 import { isString } from "@visactor/vutils";
@@ -21,27 +23,45 @@ enum AlgorithmType {
   Volatility = "volatility",
 }
 
-const getBase64 = async (spec: any, width?: number, height?: number) => {
-  spec.animation = false;
-  width && (spec.width = width);
-  height && (spec.height = height);
-  const browser = await puppeteer.launch();
-  const page = await browser.newPage();
-  await page.setContent(getHtmlVChart(spec, width, height));
+/** Prefix of the single stdout line carrying the JSON result for the Python side. */
+const RESULT_MARKER = "__VMIND_RESULT__";
 
-  const dataUrl = await page.evaluate(() => {
-    const canvas: any = document
-      .getElementById("chart-container")
-      ?.querySelector("canvas");
-    return canvas?.toDataURL("image/png");
-  });
-
-  const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
-  await browser.close();
-  return Buffer.from(base64Data, "base64");
+/** Local VChart bundle (used for offline PNG rendering) and its pinned CDN URL. */
+const resolveVChartBundle = (): { path?: string; url: string } => {
+  let version = "latest";
+  try {
+    version = require("@visactor/vchart/package.json").version;
+  } catch {}
+  const url = `https://unpkg.com/@visactor/vchart@${version}/build/index.min.js`;
+  try {
+    return { path: require.resolve("@visactor/vchart/build/index.min.js"), url };
+  } catch {
+    return { url };
+  }
 };
 
-const serializeSpec = (spec: any) => {
+const escapeHtml = (text: string) =>
+  text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+/** JSON that is safe to embed in an HTML <script> element. */
+const toScriptSafeJson = (value: string) =>
+  value
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+
+/**
+ * Serialize a chart spec. Functions (e.g. formatters produced by VMind) are encoded
+ * as strings prefixed with a random per-document marker, so data values can never be
+ * mistaken for code when the page revives them.
+ */
+const serializeSpec = (spec: any, functionMarker: string) => {
   return JSON.stringify(spec, (key, value) => {
     if (typeof value === "function") {
       const funcStr = value
@@ -49,70 +69,127 @@ const serializeSpec = (spec: any) => {
         .replace(/(\r\n|\n|\r)/gm, "")
         .replace(/\s+/g, " ");
 
-      return `__FUNCTION__${funcStr}`;
+      return `${functionMarker}${funcStr}`;
     }
     return value;
   });
 };
 
-function getHtmlVChart(spec: any, width?: number, height?: number) {
+export function getHtmlVChart(
+  spec: any,
+  width?: number,
+  height?: number,
+  options: { includeLibrary?: boolean } = {}
+) {
+  const { includeLibrary = true } = options;
+  const functionMarker = `__FUNCTION_${randomBytes(8).toString("hex")}__`;
+  const title = escapeHtml(String(spec?.title?.text ?? "Chart"));
+  const libraryTag = includeLibrary
+    ? `<script src="${resolveVChartBundle().url}"></script>`
+    : "";
   return `<!DOCTYPE html>
 <html>
 <head>
-    <title>VChart Demo</title>
-    <script src="https://unpkg.com/@visactor/vchart/build/index.min.js"></script>
+    <meta charset="utf-8">
+    <title>${title}</title>
+    ${libraryTag}
 </head>
 <body>
     <div id="chart-container" style="width: ${
-      width ? `${width}px` : "100%"
-    }; height: ${height ? `${height}px` : "100%"};"></div>
+      width ? `${Number(width)}px` : "100%"
+    }; height: ${height ? `${Number(height)}px` : "100%"};"></div>
+    <script type="application/json" id="chart-spec">${toScriptSafeJson(
+      serializeSpec(spec, functionMarker)
+    )}</script>
     <script>
-      // parse spec with function
-      function parseSpec(stringSpec) {
-        return JSON.parse(stringSpec, (k, v) => {
-          if (typeof v === 'string' && v.startsWith('__FUNCTION__')) {
-            const funcBody = v.slice(12); // 移除标记
+      function renderChart() {
+        var marker = ${JSON.stringify(functionMarker)};
+        var source = document.getElementById("chart-spec").textContent;
+        var spec = JSON.parse(source, function (k, v) {
+          if (typeof v === "string" && v.indexOf(marker) === 0) {
             try {
-              return new Function('return (' + funcBody + ')')();
-            } catch(e) {
-              console.error('函数解析失败:', e);
-              return () => {};
+              return new Function("return (" + v.slice(marker.length) + ")")();
+            } catch (e) {
+              console.error("Failed to parse function:", e);
+              return function () {};
             }
           }
           return v;
         });
+        var chart = new VChart.VChart(spec, { dom: "chart-container" });
+        chart.renderSync();
       }
-      const spec = parseSpec(\`${serializeSpec(spec)}\`);
-      const chart = new VChart.VChart(spec, {
-          dom: 'chart-container'
-      });
-      chart.renderSync();
+      if (window.VChart) {
+        renderChart();
+      }
     </script>
 </body>
 </html>
 `;
 }
 
-/**
- * get file path saved string
- * @param isUpdate {boolean} default: false, update existed file when is true
- */
+/** Render a spec to PNG with headless Chromium (honours PUPPETEER_EXECUTABLE_PATH). */
+export const getBase64 = async (spec: any, width?: number, height?: number) => {
+  spec.animation = false;
+  width && (spec.width = width);
+  height && (spec.height = height);
+  const browser = await puppeteer.launch({
+    headless: true,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+  try {
+    const page = await browser.newPage();
+    const bundle = resolveVChartBundle();
+    if (bundle.path) {
+      await page.setContent(
+        getHtmlVChart(spec, width, height, { includeLibrary: false })
+      );
+      await page.addScriptTag({ path: bundle.path });
+      await page.evaluate("renderChart()");
+    } else {
+      await page.setContent(getHtmlVChart(spec, width, height), {
+        waitUntil: "networkidle0",
+      });
+    }
+
+    const dataUrl = await page.evaluate(() => {
+      const canvas: any = document
+        .getElementById("chart-container")
+        ?.querySelector("canvas");
+      return canvas?.toDataURL("image/png");
+    });
+    if (!dataUrl) {
+      throw new Error("Chart rendering produced no canvas");
+    }
+    const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
+    return Buffer.from(base64Data, "base64");
+  } finally {
+    await browser.close();
+  }
+};
+
+const OUTPUT_EXTENSIONS = ["json", "html", "png", "md"] as const;
+
+/** A file name not used by any existing output of a previous chart. */
+function getUniqueBaseName(directory: string, fileName: string) {
+  let candidate = fileName;
+  while (
+    OUTPUT_EXTENSIONS.some((ext) =>
+      fs.existsSync(path.join(directory, "visualization", `${candidate}.${ext}`))
+    )
+  ) {
+    candidate += "_new";
+  }
+  return candidate;
+}
+
 function getSavedPathName(
   directory: string,
   fileName: string,
-  outputType: "html" | "png" | "json" | "md",
-  isUpdate: boolean = false
+  outputType: "html" | "png" | "json" | "md"
 ) {
-  let newFileName = fileName;
-  while (
-    !isUpdate &&
-    fs.existsSync(
-      path.join(directory, "visualization", `${newFileName}.${outputType}`)
-    )
-  ) {
-    newFileName += "_new";
-  }
-  return path.join(directory, "visualization", `${newFileName}.${outputType}`);
+  return path.join(directory, "visualization", `${fileName}.${outputType}`);
 }
 
 const readStdin = (): Promise<string> => {
@@ -152,13 +229,11 @@ async function saveChartRes(options: {
   fileName: string;
   width?: number;
   height?: number;
-  isUpdate?: boolean;
 }) {
-  const { directory, fileName, spec, outputType, width, height, isUpdate } =
-    options;
-  const specPath = getSavedPathName(directory, fileName, "json", isUpdate);
+  const { directory, fileName, spec, outputType, width, height } = options;
+  const specPath = getSavedPathName(directory, fileName, "json");
   fs.writeFileSync(specPath, JSON.stringify(spec, null, 2));
-  const savedPath = getSavedPathName(directory, fileName, outputType, isUpdate);
+  const savedPath = getSavedPathName(directory, fileName, outputType);
   if (outputType === "png") {
     const base64 = await getBase64(spec, width, height);
     fs.writeFileSync(savedPath, base64);
@@ -219,16 +294,15 @@ async function generateChart(
     spec.title = {
       text: userPrompt,
     };
-    if (!fs.existsSync(path.join(directory, "visualization"))) {
-      fs.mkdirSync(path.join(directory, "visualization"));
-    }
-    const specPath = getSavedPathName(directory, fileName, "json");
+    fs.mkdirSync(path.join(directory, "visualization"), { recursive: true });
+    const baseName = getUniqueBaseName(directory, fileName);
+    const specPath = getSavedPathName(directory, baseName, "json");
     res.chart_path = await saveChartRes({
       directory,
       spec,
       width,
       height,
-      fileName,
+      fileName: baseName,
       outputType,
     });
 
@@ -273,7 +347,7 @@ async function generateChart(
     res = {
       ...res,
       ...setInsightTemplate(
-        getSavedPathName(directory, fileName, "md"),
+        getSavedPathName(directory, baseName, "md"),
         userPrompt,
         insightsText
       ),
@@ -297,7 +371,7 @@ async function updateChartWithInsight(
   const { directory, outputType, fileName, insightsId } = options;
   let res: { error?: string; chart_path?: string } = {};
   try {
-    const specPath = getSavedPathName(directory, fileName, "json", true);
+    const specPath = getSavedPathName(directory, fileName, "json");
     const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
     // llm select index from 1
     const insights = (spec.insights || []).filter(
@@ -312,7 +386,6 @@ async function updateChartWithInsight(
       directory,
       outputType,
       fileName,
-      isUpdate: true,
     });
   } catch (error: any) {
     res.error = error.toString();
@@ -321,10 +394,13 @@ async function updateChartWithInsight(
   }
 }
 
+const writeResult = (res: object) => {
+  process.stdout.write(`${RESULT_MARKER}${JSON.stringify(res)}\n`);
+};
+
 async function executeVMind() {
   const input = await readStdin();
   const inputData = JSON.parse(input);
-  let res;
   const {
     llm_config,
     width,
@@ -348,7 +424,7 @@ async function executeVMind() {
     },
   });
   if (taskType === "visualization") {
-    res = await generateChart(vmind, {
+    return generateChart(vmind, {
       dataset,
       userPrompt,
       directory,
@@ -358,15 +434,23 @@ async function executeVMind() {
       height,
       language,
     });
-  } else if (taskType === "insight" && insightsId.length) {
-    res = await updateChartWithInsight(vmind, {
+  }
+  if (taskType === "insight") {
+    if (!insightsId.length) {
+      return { error: "No insights were selected (insights_id is empty)" };
+    }
+    return updateChartWithInsight(vmind, {
       directory,
       fileName,
       outputType,
       insightsId,
     });
   }
-  console.log(JSON.stringify(res));
+  return { error: `Unknown task_type: ${taskType}` };
 }
 
-executeVMind();
+if (require.main === module) {
+  executeVMind()
+    .then(writeResult)
+    .catch((error: any) => writeResult({ error: String(error?.message ?? error) }));
+}

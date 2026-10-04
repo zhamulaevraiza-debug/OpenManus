@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import mimetypes
 import os
@@ -122,7 +123,9 @@ class SandboxVisionTool(SandboxToolsBase):
             cleaned_path = self.clean_path(file_path)
             full_path = f"{self.workspace_path}/{cleaned_path}"
             try:
-                file_info = self.sandbox.fs.get_file_info(full_path)
+                file_info = await asyncio.to_thread(
+                    self.sandbox.fs.get_file_info, full_path
+                )
                 if file_info.is_dir:
                     return self.fail_response(f"路径 '{cleaned_path}' 是目录，不是图片文件。")
             except Exception:
@@ -132,7 +135,9 @@ class SandboxVisionTool(SandboxToolsBase):
                     f"图片文件 '{cleaned_path}' 过大 ({file_info.size / (1024*1024):.2f}MB)，最大允许 {MAX_IMAGE_SIZE / (1024*1024)}MB。"
                 )
             try:
-                image_bytes = self.sandbox.fs.download_file(full_path)
+                image_bytes = await asyncio.to_thread(
+                    self.sandbox.fs.download_file, full_path
+                )
             except Exception:
                 return self.fail_response(f"无法读取图片文件: {cleaned_path}")
             mime_type, _ = mimetypes.guess_type(full_path)
@@ -150,8 +155,8 @@ class SandboxVisionTool(SandboxToolsBase):
                     return self.fail_response(
                         f"不支持或未知的图片格式: '{cleaned_path}'。支持: JPG, PNG, GIF, WEBP。"
                     )
-            compressed_bytes, compressed_mime_type = self.compress_image(
-                image_bytes, mime_type, cleaned_path
+            compressed_bytes, compressed_mime_type = await asyncio.to_thread(
+                self.compress_image, image_bytes, mime_type, cleaned_path
             )
             if len(compressed_bytes) > MAX_COMPRESSED_SIZE:
                 return self.fail_response(

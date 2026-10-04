@@ -1,16 +1,19 @@
 import asyncio
 import io
 import os
+import shlex
+import shutil
 import tarfile
 import tempfile
 import uuid
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import docker
 from docker.errors import NotFound
 from docker.models.containers import Container
 
 from app.config import SandboxSettings
+from app.logger import logger
 from app.sandbox.core.exceptions import SandboxTimeoutError
 from app.sandbox.core.terminal import AsyncDockerizedTerminal
 
@@ -45,6 +48,7 @@ class DockerSandbox:
         self.client = docker.from_env()
         self.container: Optional[Container] = None
         self.terminal: Optional[AsyncDockerizedTerminal] = None
+        self._host_dirs: List[str] = []
 
     async def create(self) -> "DockerSandbox":
         """Creates and starts the sandbox container.
@@ -82,17 +86,19 @@ class DockerSandbox:
                 detach=True,
             )
 
-            self.container = self.client.containers.get(container["Id"])
+            self.container = await asyncio.to_thread(
+                self.client.containers.get, container["Id"]
+            )
 
             # Start container
             await asyncio.to_thread(self.container.start)
 
-            # Initialize terminal
+            # Initialize terminal (Python output unbuffered)
             self.terminal = AsyncDockerizedTerminal(
-                container["Id"],
+                self.container,
                 self.config.work_dir,
-                env_vars={"PYTHONUNBUFFERED": "1"}
-                # Ensure Python output is not buffered
+                env_vars={"PYTHONUNBUFFERED": "1"},
+                client=self.client,
             )
             await self.terminal.init()
 
@@ -120,9 +126,8 @@ class DockerSandbox:
 
         return bindings
 
-    @staticmethod
-    def _ensure_host_dir(path: str) -> str:
-        """Ensures directory exists on the host.
+    def _ensure_host_dir(self, path: str) -> str:
+        """Creates a fresh host directory for ``path`` (removed on cleanup).
 
         Args:
             path: Directory path.
@@ -135,6 +140,7 @@ class DockerSandbox:
             f"sandbox_{os.path.basename(path)}_{os.urandom(4).hex()}",
         )
         os.makedirs(host_path, exist_ok=True)
+        self._host_dirs.append(host_path)
         return host_path
 
     async def run_command(self, cmd: str, timeout: Optional[int] = None) -> str:
@@ -214,7 +220,7 @@ class DockerSandbox:
 
             # Create parent directory
             if parent_dir:
-                await self.run_command(f"mkdir -p {parent_dir}")
+                await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
 
             # Prepare file data
             tar_stream = await self._create_tar_stream(
@@ -291,7 +297,7 @@ class DockerSandbox:
 
                     # If destination is a directory, we should preserve relative path structure
                     if os.path.isdir(dst_path):
-                        tar.extractall(dst_path)
+                        tar.extractall(dst_path, filter="data")
                     else:
                         # If destination is a file, we only extract the source file's content
                         if len(members) > 1:
@@ -331,7 +337,7 @@ class DockerSandbox:
             resolved_dst = self._safe_resolve_path(dst_path)
             container_dir = os.path.dirname(resolved_dst)
             if container_dir:
-                await self.run_command(f"mkdir -p {container_dir}")
+                await self.run_command(f"mkdir -p {shlex.quote(container_dir)}")
 
             # Create tar file to upload
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -339,7 +345,6 @@ class DockerSandbox:
                 with tarfile.open(tar_path, "w") as tar:
                     # Handle directory source path
                     if os.path.isdir(src_path):
-                        os.path.basename(src_path.rstrip("/"))
                         for root, _, files in os.walk(src_path):
                             for file in files:
                                 file_path = os.path.join(root, file)
@@ -365,7 +370,7 @@ class DockerSandbox:
 
                 # Verify file was created successfully
                 try:
-                    await self.run_command(f"test -e {resolved_dst}")
+                    await self.run_command(f"test -e {shlex.quote(resolved_dst)}")
                 except Exception:
                     raise RuntimeError(f"Failed to verify file creation: {dst_path}")
 
@@ -450,8 +455,12 @@ class DockerSandbox:
         except Exception as e:
             errors.append(f"General cleanup error: {e}")
 
+        host_dirs, self._host_dirs = self._host_dirs, []
+        for host_dir in host_dirs:
+            await asyncio.to_thread(shutil.rmtree, host_dir, ignore_errors=True)
+
         if errors:
-            print(f"Warning: Errors during cleanup: {', '.join(errors)}")
+            logger.warning(f"Errors during sandbox cleanup: {', '.join(errors)}")
 
     async def __aenter__(self) -> "DockerSandbox":
         """Async context manager entry."""

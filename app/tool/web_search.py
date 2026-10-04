@@ -1,14 +1,17 @@
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-from tenacity import retry, stop_after_attempt, wait_exponential
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
 
 from app.config import config
+from app.context import current_run
 from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
+from app.tool.net_guard import UnsafeURLError, check_url_sync
 from app.tool.search import (
     BaiduSearchEngine,
     BingSearchEngine,
@@ -17,6 +20,31 @@ from app.tool.search import (
     WebSearchEngine,
 )
 from app.tool.search.base import SearchItem
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+MAX_FETCHED_CHARS = 10000
+MAX_REDIRECTS = 5
+ENGINE_TIMEOUT_SECONDS = 30
+
+# Per-engine attempts and maximum backoff (seconds) between them.
+CLI_ENGINE_ATTEMPTS = 3
+CLI_ENGINE_MAX_BACKOFF = 10
+# Retry policy when a web run is active: users are waiting on the result.
+SERVER_ENGINE_ATTEMPTS = 2
+SERVER_ENGINE_MAX_BACKOFF = 2
+SERVER_MAX_RETRY_DELAY = 5
+SERVER_MAX_RETRIES = 1
+
+ENGINE_FACTORIES: Dict[str, Callable[[], WebSearchEngine]] = {
+    "google": GoogleSearchEngine,
+    "baidu": BaiduSearchEngine,
+    "duckduckgo": DuckDuckGoSearchEngine,
+    "bing": BingSearchEngine,
+}
 
 
 class SearchResult(BaseModel):
@@ -92,7 +120,7 @@ class SearchResponse(ToolResult):
         if self.metadata:
             result_text.extend(
                 [
-                    f"\nMetadata:",
+                    "\nMetadata:",
                     f"- Total results: {self.metadata.total_results}",
                     f"- Language: {self.metadata.language}",
                     f"- Country: {self.metadata.country}",
@@ -111,6 +139,8 @@ class WebContentFetcher:
         """
         Fetch and extract the main content from a webpage.
 
+        Only public http(s) addresses are fetched (every redirect hop is checked).
+
         Args:
             url: The URL to fetch content from
             timeout: Request timeout in seconds
@@ -118,39 +148,49 @@ class WebContentFetcher:
         Returns:
             Extracted text content or None if fetching fails
         """
-        headers = {
-            "WebSearch": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-
         try:
-            # Use asyncio to run requests in a thread pool
-            response = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: requests.get(url, headers=headers, timeout=timeout)
-            )
-
-            if response.status_code != 200:
-                logger.warning(
-                    f"Failed to fetch content from {url}: HTTP {response.status_code}"
-                )
-                return None
-
-            # Parse HTML with BeautifulSoup
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # Remove script and style elements
-            for script in soup(["script", "style", "header", "footer", "nav"]):
-                script.extract()
-
-            # Get text content
-            text = soup.get_text(separator="\n", strip=True)
-
-            # Clean up whitespace and limit size (100KB max)
-            text = " ".join(text.split())
-            return text[:10000] if text else None
-
+            return await asyncio.to_thread(WebContentFetcher._fetch_text, url, timeout)
         except Exception as e:
             logger.warning(f"Error fetching content from {url}: {e}")
             return None
+
+    @staticmethod
+    def _fetch_text(url: str, timeout: int) -> Optional[str]:
+        response = WebContentFetcher._get_public(url, timeout)
+        if response is None:
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                f"Failed to fetch content from {url}: HTTP {response.status_code}"
+            )
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for element in soup(["script", "style", "header", "footer", "nav"]):
+            element.extract()
+        text = " ".join(soup.get_text(separator="\n", strip=True).split())
+        return text[:MAX_FETCHED_CHARS] if text else None
+
+    @staticmethod
+    def _get_public(url: str, timeout: int) -> Optional[requests.Response]:
+        """GET ``url`` following redirects manually; every hop must be public."""
+        headers = {"User-Agent": USER_AGENT}
+        with requests.Session() as session:
+            for _ in range(MAX_REDIRECTS + 1):
+                try:
+                    check_url_sync(url)
+                except UnsafeURLError as e:
+                    logger.warning(f"Skipping content fetch: {e.message}")
+                    return None
+                response = session.get(
+                    url, headers=headers, timeout=timeout, allow_redirects=False
+                )
+                location = response.headers.get("Location")
+                if not response.is_redirect or not location:
+                    return response
+                url = urljoin(url, location)
+        logger.warning(f"Too many redirects while fetching {url}")
+        return None
 
 
 class WebSearch(BaseTool):
@@ -190,13 +230,18 @@ class WebSearch(BaseTool):
         },
         "required": ["query"],
     }
-    _search_engine: dict[str, WebSearchEngine] = {
-        "google": GoogleSearchEngine(),
-        "baidu": BaiduSearchEngine(),
-        "duckduckgo": DuckDuckGoSearchEngine(),
-        "bing": BingSearchEngine(),
-    }
     content_fetcher: WebContentFetcher = WebContentFetcher()
+
+    # Engines are created on first use (Bing opens an HTTP session).
+    _search_engine: Optional[Dict[str, WebSearchEngine]] = PrivateAttr(default=None)
+
+    @property
+    def search_engines(self) -> Dict[str, WebSearchEngine]:
+        if self._search_engine is None:
+            self._search_engine = {
+                name: factory() for name, factory in ENGINE_FACTORIES.items()
+            }
+        return self._search_engine
 
     async def execute(
         self,
@@ -230,6 +275,10 @@ class WebSearch(BaseTool):
             if config.search_config
             else 3
         )
+        if current_run() is not None:
+            retry_delay = min(retry_delay, SERVER_MAX_RETRY_DELAY)
+            max_retries = min(max_retries, SERVER_MAX_RETRIES)
+        num_results = max(1, min(int(num_results or 5), 20))
 
         # Use config values for lang and country if not specified
         if lang is None:
@@ -294,14 +343,22 @@ class WebSearch(BaseTool):
         engine_order = self._get_engine_order()
         failed_engines = []
 
+        engines = self.search_engines
         for engine_name in engine_order:
-            engine = self._search_engine[engine_name]
+            engine = engines[engine_name]
             logger.info(f"🔎 Attempting search with {engine_name.capitalize()}...")
-            search_items = await self._perform_search_with_engine(
-                engine, query, num_results, search_params
-            )
+            try:
+                search_items = await self._perform_search_with_engine(
+                    engine, query, num_results, search_params
+                )
+            except Exception as e:
+                logger.warning(f"Search with {engine_name.capitalize()} failed: {e}")
+                failed_engines.append(engine_name)
+                continue
 
+            search_items = [item for item in search_items if item and item.url]
             if not search_items:
+                failed_engines.append(engine_name)
                 continue
 
             if failed_engines:
@@ -372,21 +429,15 @@ class WebSearch(BaseTool):
         )
 
         # Start with preferred engine, then fallbacks, then remaining engines
-        engine_order = [preferred] if preferred in self._search_engine else []
+        engines = self.search_engines
+        engine_order = [preferred] if preferred in engines else []
         engine_order.extend(
-            [
-                fb
-                for fb in fallbacks
-                if fb in self._search_engine and fb not in engine_order
-            ]
+            [fb for fb in fallbacks if fb in engines and fb not in engine_order]
         )
-        engine_order.extend([e for e in self._search_engine if e not in engine_order])
+        engine_order.extend([e for e in engines if e not in engine_order])
 
         return engine_order
 
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10)
-    )
     async def _perform_search_with_engine(
         self,
         engine: WebSearchEngine,
@@ -394,18 +445,42 @@ class WebSearch(BaseTool):
         num_results: int,
         search_params: Dict[str, Any],
     ) -> List[SearchItem]:
-        """Execute search with the given engine and parameters."""
-        return await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: list(
+        """Execute search with the given engine, retrying transient failures.
+
+        Engines are synchronous libraries and run in worker threads; each attempt is
+        bounded by ``ENGINE_TIMEOUT_SECONDS``. Web runs retry once with a short delay.
+        """
+        server_mode = current_run() is not None
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(
+                SERVER_ENGINE_ATTEMPTS if server_mode else CLI_ENGINE_ATTEMPTS
+            ),
+            wait=wait_exponential(
+                multiplier=1,
+                min=1,
+                max=SERVER_ENGINE_MAX_BACKOFF
+                if server_mode
+                else CLI_ENGINE_MAX_BACKOFF,
+            ),
+            reraise=True,
+        )
+
+        def search() -> List[SearchItem]:
+            return list(
                 engine.perform_search(
                     query,
                     num_results=num_results,
                     lang=search_params.get("lang"),
                     country=search_params.get("country"),
                 )
-            ),
-        )
+            )
+
+        async def attempt() -> List[SearchItem]:
+            return await asyncio.wait_for(
+                asyncio.to_thread(search), ENGINE_TIMEOUT_SECONDS
+            )
+
+        return await retrying(attempt)
 
 
 if __name__ == "__main__":
@@ -415,4 +490,4 @@ if __name__ == "__main__":
             query="Python programming", fetch_content=True, num_results=1
         )
     )
-    print(search_response.to_tool_result())
+    print(search_response)

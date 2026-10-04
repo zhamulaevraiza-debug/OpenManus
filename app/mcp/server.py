@@ -7,18 +7,56 @@ logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stde
 import argparse
 import asyncio
 import atexit
+import base64
 import json
 from inspect import Parameter, Signature
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 
 from app.logger import logger
-from app.tool.base import BaseTool
+from app.tool.base import BaseTool, ToolResult
 from app.tool.bash import Bash
 from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.str_replace_editor import StrReplaceEditor
 from app.tool.terminate import Terminate
+
+
+def _image_mime_type(data_b64: str) -> str:
+    head = base64.b64decode(data_b64[:24] + "=" * (-len(data_b64[:24]) % 4))
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head.startswith(b"GIF8"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def to_mcp_content(result: Any) -> Union[str, List[Union[TextContent, ImageContent]]]:
+    """Convert a tool result to MCP content (text plus an image when present).
+
+    Failed ToolResults raise, so the client receives ``isError=True``.
+    """
+    if isinstance(result, ToolResult):
+        if result.error:
+            raise RuntimeError(result.error)
+        content: List[Union[TextContent, ImageContent]] = [
+            TextContent(type="text", text=str(result))
+        ]
+        if result.base64_image:
+            content.append(
+                ImageContent(
+                    type="image",
+                    data=result.base64_image,
+                    mimeType=_image_mime_type(result.base64_image),
+                )
+            )
+        return content
+    if isinstance(result, dict):
+        return json.dumps(result, ensure_ascii=False, default=str)
+    return result if isinstance(result, str) else str(result)
 
 
 class MCPServer:
@@ -46,13 +84,7 @@ class MCPServer:
             result = await tool.execute(**kwargs)
 
             logger.info(f"Result of {tool_name}: {result}")
-
-            # Handle different types of results (match original logic)
-            if hasattr(result, "model_dump"):
-                return json.dumps(result.model_dump())
-            elif isinstance(result, dict):
-                return json.dumps(result)
-            return result
+            return to_mcp_content(result)
 
         # Set method metadata
         tool_method.__name__ = tool_name

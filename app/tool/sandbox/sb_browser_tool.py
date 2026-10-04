@@ -1,8 +1,11 @@
+import asyncio
 import base64
 import io
 import json
+import shlex
 import traceback
-from typing import Optional  # Add this import for Optional
+from typing import Optional
+from urllib.parse import urlencode
 
 from PIL import Image
 from pydantic import Field
@@ -200,20 +203,17 @@ class SandboxBrowserTool(SandboxToolsBase):
             await self._ensure_sandbox()
             url = f"http://localhost:8003/api/automation/{endpoint}"
             if method == "GET" and params:
-                query_params = "&".join([f"{k}={v}" for k, v in params.items()])
-                url = f"{url}?{query_params}"
-                curl_cmd = (
-                    f"curl -s -X {method} '{url}' -H 'Content-Type: application/json'"
-                )
-            else:
-                curl_cmd = (
-                    f"curl -s -X {method} '{url}' -H 'Content-Type: application/json'"
-                )
-                if params:
-                    json_data = json.dumps(params)
-                    curl_cmd += f" -d '{json_data}'"
-            logger.debug(f"Executing curl command: {curl_cmd}")
-            response = self.sandbox.process.exec(curl_cmd, timeout=30)
+                url = f"{url}?{urlencode(params)}"
+            curl_cmd = (
+                f"curl -s -X {shlex.quote(method)} {shlex.quote(url)} "
+                "-H 'Content-Type: application/json'"
+            )
+            if method != "GET" and params:
+                curl_cmd += f" -d {shlex.quote(json.dumps(params))}"
+            logger.debug(f"Executing browser automation request: {method} {endpoint}")
+            response = await asyncio.to_thread(
+                self.sandbox.process.exec, curl_cmd, timeout=30
+            )
             if response.exit_code == 0:
                 try:
                     result = json.loads(response.result)
@@ -260,7 +260,7 @@ class SandboxBrowserTool(SandboxToolsBase):
                     return (
                         self.success_response(success_response)
                         if success_response["success"]
-                        else self.fail_response(success_response)
+                        else self.fail_response(json.dumps(success_response))
                     )
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse response JSON: {e}")
@@ -431,9 +431,9 @@ class SandboxBrowserTool(SandboxToolsBase):
             state_info = {
                 "url": state.get("url", ""),
                 "title": state.get("title", ""),
-                "tabs": [tab.model_dump() for tab in state.get("tabs", [])],
-                "pixels_above": getattr(state, "pixels_above", 0),
-                "pixels_below": getattr(state, "pixels_below", 0),
+                "tabs": state.get("tabs", []),
+                "pixels_above": state.get("pixels_above", 0),
+                "pixels_below": state.get("pixels_below", 0),
                 "help": "[0], [1], [2], etc., represent clickable indices corresponding to the elements listed. Clicking on these indices will navigate to or interact with the respective content behind them.",
             }
 

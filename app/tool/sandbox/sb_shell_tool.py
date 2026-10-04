@@ -1,11 +1,21 @@
 import asyncio
-import time
+import re
+import secrets
+import shlex
 from typing import Any, Dict, Optional, TypeVar
 from uuid import uuid4
+
+from pydantic import PrivateAttr
 
 from app.daytona.tool_base import Sandbox, SandboxToolsBase
 from app.tool.base import ToolResult
 from app.utils.logger import logger
+
+
+MAX_OUTPUT_CHARS = 20000
+POLL_INTERVAL_SECONDS = 2
+RAW_COMMAND_TIMEOUT_SECONDS = 30
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 Context = TypeVar("Context")
@@ -81,6 +91,8 @@ class SandboxShellTool(SandboxToolsBase):
         },
     }
 
+    _lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+
     def __init__(
         self, sandbox: Optional[Sandbox] = None, thread_id: Optional[str] = None, **data
     ):
@@ -95,7 +107,7 @@ class SandboxShellTool(SandboxToolsBase):
             session_id = str(uuid4())
             try:
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
-                self.sandbox.process.create_session(session_id)
+                await asyncio.to_thread(self.sandbox.process.create_session, session_id)
                 self._sessions[session_name] = session_id
             except Exception as e:
                 raise RuntimeError(f"Failed to create session: {str(e)}")
@@ -106,34 +118,55 @@ class SandboxShellTool(SandboxToolsBase):
         if session_name in self._sessions:
             try:
                 await self._ensure_sandbox()  # Ensure sandbox is initialized
-                self.sandbox.process.delete_session(self._sessions[session_name])
+                await asyncio.to_thread(
+                    self.sandbox.process.delete_session, self._sessions[session_name]
+                )
                 del self._sessions[session_name]
             except Exception as e:
-                print(f"Warning: Failed to cleanup session {session_name}: {str(e)}")
+                logger.warning(f"Failed to cleanup session {session_name}: {str(e)}")
 
     async def _execute_raw_command(self, command: str) -> Dict[str, Any]:
         """Execute a raw command directly in the sandbox."""
+        from daytona import SessionExecuteRequest
+
         # Ensure session exists for raw commands
         session_id = await self._ensure_session("raw_commands")
+        req = SessionExecuteRequest(command=command, run_async=False)
 
-        # Execute command in session
-        from app.daytona.sandbox import SessionExecuteRequest
+        def _run() -> Dict[str, Any]:
+            response = self.sandbox.process.execute_session_command(
+                session_id=session_id,
+                req=req,
+                timeout=RAW_COMMAND_TIMEOUT_SECONDS,
+            )
+            logs = self.sandbox.process.get_session_command_logs(
+                session_id=session_id, command_id=response.cmd_id
+            )
+            return {"output": logs, "exit_code": response.exit_code}
 
-        req = SessionExecuteRequest(
-            command=command, run_async=False, cwd=self.workspace_path
+        return await asyncio.to_thread(_run)
+
+    async def _tmux(self, *args: str) -> Dict[str, Any]:
+        """Run a tmux command with safely quoted arguments."""
+        return await self._execute_raw_command(
+            "tmux " + " ".join(shlex.quote(arg) for arg in args)
         )
 
-        response = self.sandbox.process.execute_session_command(
-            session_id=session_id,
-            req=req,
-            timeout=30,  # Short timeout for utility commands
+    async def _session_exists(self, session_name: str) -> bool:
+        result = await self._execute_raw_command(
+            f"tmux has-session -t {shlex.quote(session_name)} 2>/dev/null "
+            "|| echo 'not_exists'"
         )
+        return "not_exists" not in result.get("output", "")
 
-        logs = self.sandbox.process.get_session_command_logs(
-            session_id=session_id, command_id=response.cmd_id
+    async def _capture_pane(self, session_name: str) -> str:
+        result = await self._tmux(
+            "capture-pane", "-t", session_name, "-p", "-S", "-", "-E", "-"
         )
-
-        return {"output": logs, "exit_code": response.exit_code}
+        output = result.get("output", "") or ""
+        if len(output) > MAX_OUTPUT_CHARS:
+            output = "... [earlier output truncated]\n" + output[-MAX_OUTPUT_CHARS:]
+        return output
 
     async def _execute_command(
         self,
@@ -156,85 +189,24 @@ class SandboxShellTool(SandboxToolsBase):
             # Generate a session name if not provided
             if not session_name:
                 session_name = f"session_{str(uuid4())[:8]}"
-
-            # Check if tmux session already exists
-            check_session = await self._execute_raw_command(
-                f"tmux has-session -t {session_name} 2>/dev/null || echo 'not_exists'"
-            )
-            session_exists = "not_exists" not in check_session.get("output", "")
-
-            if not session_exists:
-                # Create a new tmux session
-                await self._execute_raw_command(
-                    f"tmux new-session -d -s {session_name}"
+            elif not _SESSION_NAME_RE.match(session_name):
+                return self.fail_response(
+                    "session_name may only contain letters, digits, '.', '_' and '-'"
                 )
 
-            # Ensure we're in the correct directory and send command to tmux
-            full_command = f"cd {cwd} && {command}"
-            wrapped_command = full_command.replace('"', '\\"')  # Escape double quotes
+            if not await self._session_exists(session_name):
+                await self._tmux("new-session", "-d", "-s", session_name)
 
-            # Send command to tmux session
-            await self._execute_raw_command(
-                f'tmux send-keys -t {session_name} "{wrapped_command}" Enter'
-            )
-
+            # Run in the requested directory; blocking commands print a unique
+            # completion marker with their exit code.
+            marker = f"__OM_DONE_{secrets.token_hex(6)}__"
+            full_command = f"cd {shlex.quote(cwd)} && {command}"
             if blocking:
-                # For blocking execution, wait and capture output
-                start_time = time.time()
-                while (time.time() - start_time) < timeout:
-                    # Wait a bit before checking
-                    time.sleep(2)
+                full_command = f"{full_command}; echo {marker}$?"
+            await self._tmux("send-keys", "-t", session_name, "-l", full_command)
+            await self._tmux("send-keys", "-t", session_name, "Enter")
 
-                    # Check if session still exists (command might have exited)
-                    check_result = await self._execute_raw_command(
-                        f"tmux has-session -t {session_name} 2>/dev/null || echo 'ended'"
-                    )
-                    if "ended" in check_result.get("output", ""):
-                        break
-
-                    # Get current output and check for common completion indicators
-                    output_result = await self._execute_raw_command(
-                        f"tmux capture-pane -t {session_name} -p -S - -E -"
-                    )
-                    current_output = output_result.get("output", "")
-
-                    # Check for prompt indicators that suggest command completion
-                    last_lines = current_output.split("\n")[-3:]
-                    completion_indicators = [
-                        "$",
-                        "#",
-                        ">",
-                        "Done",
-                        "Completed",
-                        "Finished",
-                        "✓",
-                    ]
-                    if any(
-                        indicator in line
-                        for indicator in completion_indicators
-                        for line in last_lines
-                    ):
-                        break
-
-                # Capture final output
-                output_result = await self._execute_raw_command(
-                    f"tmux capture-pane -t {session_name} -p -S - -E -"
-                )
-                final_output = output_result.get("output", "")
-
-                # Kill the session after capture
-                await self._execute_raw_command(f"tmux kill-session -t {session_name}")
-
-                return self.success_response(
-                    {
-                        "output": final_output,
-                        "session_name": session_name,
-                        "cwd": cwd,
-                        "completed": True,
-                    }
-                )
-            else:
-                # For non-blocking, just return immediately
+            if not blocking:
                 return self.success_response(
                     {
                         "session_name": session_name,
@@ -244,14 +216,41 @@ class SandboxShellTool(SandboxToolsBase):
                     }
                 )
 
+            done = re.compile(re.escape(marker) + r"(\d+)")
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + max(1, timeout)
+            exit_code: Optional[int] = None
+            output = ""
+            while loop.time() < deadline:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                if not await self._session_exists(session_name):
+                    break
+                output = await self._capture_pane(session_name)
+                match = done.search(output)
+                if match:
+                    exit_code = int(match.group(1))
+                    break
+            else:
+                output = await self._capture_pane(session_name)
+
+            await self._tmux("kill-session", "-t", session_name)
+            output = done.sub("", output.replace(f"; echo {marker}$?", ""))
+            return self.success_response(
+                {
+                    "output": output,
+                    "session_name": session_name,
+                    "cwd": cwd,
+                    "completed": exit_code is not None,
+                    "exit_code": exit_code,
+                }
+            )
+
         except Exception as e:
             # Attempt to clean up session in case of error
             if session_name:
                 try:
-                    await self._execute_raw_command(
-                        f"tmux kill-session -t {session_name}"
-                    )
-                except:
+                    await self._tmux("kill-session", "-t", session_name)
+                except Exception:
                     pass
             return self.fail_response(f"Error executing command: {str(e)}")
 
@@ -262,24 +261,16 @@ class SandboxShellTool(SandboxToolsBase):
             # Ensure sandbox is initialized
             await self._ensure_sandbox()
 
-            # Check if session exists
-            check_result = await self._execute_raw_command(
-                f"tmux has-session -t {session_name} 2>/dev/null || echo 'not_exists'"
-            )
-            if "not_exists" in check_result.get("output", ""):
+            if not await self._session_exists(session_name):
                 return self.fail_response(
                     f"Tmux session '{session_name}' does not exist."
                 )
 
-            # Get output from tmux pane
-            output_result = await self._execute_raw_command(
-                f"tmux capture-pane -t {session_name} -p -S - -E -"
-            )
-            output = output_result.get("output", "")
+            output = await self._capture_pane(session_name)
 
             # Kill session if requested
             if kill_session:
-                await self._execute_raw_command(f"tmux kill-session -t {session_name}")
+                await self._tmux("kill-session", "-t", session_name)
                 termination_status = "Session terminated."
             else:
                 termination_status = "Session still running."
@@ -300,17 +291,13 @@ class SandboxShellTool(SandboxToolsBase):
             # Ensure sandbox is initialized
             await self._ensure_sandbox()
 
-            # Check if session exists
-            check_result = await self._execute_raw_command(
-                f"tmux has-session -t {session_name} 2>/dev/null || echo 'not_exists'"
-            )
-            if "not_exists" in check_result.get("output", ""):
+            if not await self._session_exists(session_name):
                 return self.fail_response(
                     f"Tmux session '{session_name}' does not exist."
                 )
 
             # Kill the session
-            await self._execute_raw_command(f"tmux kill-session -t {session_name}")
+            await self._tmux("kill-session", "-t", session_name)
 
             return self.success_response(
                 {"message": f"Tmux session '{session_name}' terminated successfully."}
@@ -357,7 +344,7 @@ class SandboxShellTool(SandboxToolsBase):
     async def execute(
         self,
         action: str,
-        command: str,
+        command: Optional[str] = None,
         folder: Optional[str] = None,
         session_name: Optional[str] = None,
         blocking: bool = False,
@@ -365,37 +352,38 @@ class SandboxShellTool(SandboxToolsBase):
         kill_session: bool = False,
     ) -> ToolResult:
         """
-        Execute a browser action in the sandbox environment.
+        Execute a shell action in the sandbox environment.
         Args:
-            timeout:
-            blocking:
-            session_name:
-            folder:
-            command:
-            kill_session:
-            action: The browser action to perform
+            action: The shell action to perform
+            command: Command for execute_command
+            folder: Sub-directory of /workspace to run the command in
+            session_name: tmux session to use
+            blocking: Wait for the command to finish
+            timeout: Seconds to wait for blocking commands
+            kill_session: Terminate the session after checking its output
         Returns:
             ToolResult with the action's output or error
         """
-        async with asyncio.Lock():
+        async with self._lock:
             try:
-                # Navigation actions
                 if action == "execute_command":
                     if not command:
-                        return self.fail_response("command is required for navigation")
+                        return self.fail_response(
+                            "command is required for execute_command"
+                        )
                     return await self._execute_command(
                         command, folder, session_name, blocking, timeout
                     )
                 elif action == "check_command_output":
                     if session_name is None:
                         return self.fail_response(
-                            "session_name is required for navigation"
+                            "session_name is required for check_command_output"
                         )
                     return await self._check_command_output(session_name, kill_session)
                 elif action == "terminate_command":
                     if session_name is None:
                         return self.fail_response(
-                            "session_name is required for click_element"
+                            "session_name is required for terminate_command"
                         )
                     return await self._terminate_command(session_name)
                 elif action == "list_commands":
@@ -408,12 +396,13 @@ class SandboxShellTool(SandboxToolsBase):
 
     async def cleanup(self):
         """Clean up all sessions."""
+        if self._sandbox is None:
+            return
         for session_name in list(self._sessions.keys()):
             await self._cleanup_session(session_name)
 
         # Also clean up any tmux sessions
         try:
-            await self._ensure_sandbox()
             await self._execute_raw_command("tmux kill-server 2>/dev/null || true")
         except Exception as e:
             logger.error(f"Error shell box cleanup action: {e}")

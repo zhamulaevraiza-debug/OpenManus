@@ -1,3 +1,4 @@
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Protocol
 
@@ -89,6 +90,7 @@ class LocalSandboxClient(BaseSandboxClient):
     def __init__(self):
         """Initializes local sandbox client."""
         self.sandbox: Optional[DockerSandbox] = None
+        self._create_lock = asyncio.Lock()
 
     async def create(
         self,
@@ -104,8 +106,10 @@ class LocalSandboxClient(BaseSandboxClient):
         Raises:
             RuntimeError: If sandbox creation fails.
         """
-        self.sandbox = DockerSandbox(config, volume_bindings)
-        await self.sandbox.create()
+        async with self._create_lock:
+            sandbox = DockerSandbox(config, volume_bindings)
+            await sandbox.create()
+            self.sandbox = sandbox
 
     async def run_command(self, command: str, timeout: Optional[int] = None) -> str:
         """Runs command in sandbox.

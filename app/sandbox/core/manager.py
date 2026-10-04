@@ -54,6 +54,7 @@ class SandboxManager:
         self._locks: Dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
         self._active_operations: Set[str] = set()
+        self._pending_creations = 0
 
         # Cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -72,14 +73,12 @@ class SandboxManager:
             bool: Whether image is available.
         """
         try:
-            self._client.images.get(image)
+            await asyncio.to_thread(self._client.images.get, image)
             return True
         except ImageNotFound:
             try:
                 logger.info(f"Pulling image {image}...")
-                await asyncio.get_event_loop().run_in_executor(
-                    None, self._client.images.pull, image
-                )
+                await asyncio.to_thread(self._client.images.pull, image)
                 return True
             except (APIError, Exception) as e:
                 logger.error(f"Failed to pull image {image}: {e}")
@@ -106,7 +105,7 @@ class SandboxManager:
 
             self._active_operations.add(sandbox_id)
             try:
-                self._last_used[sandbox_id] = asyncio.get_event_loop().time()
+                self._last_used[sandbox_id] = asyncio.get_running_loop().time()
                 yield self._sandboxes[sandbox_id]
             finally:
                 self._active_operations.remove(sandbox_id)
@@ -128,33 +127,38 @@ class SandboxManager:
         Raises:
             RuntimeError: If max sandbox count reached or creation fails.
         """
+        # Reserve a slot under the lock, but create the container without holding
+        # it so slow pulls/creations do not serialize every other operation.
         async with self._global_lock:
-            if len(self._sandboxes) >= self.max_sandboxes:
+            if len(self._sandboxes) + self._pending_creations >= self.max_sandboxes:
                 raise RuntimeError(
                     f"Maximum number of sandboxes ({self.max_sandboxes}) reached"
                 )
+            self._pending_creations += 1
 
+        try:
             config = config or SandboxSettings()
             if not await self.ensure_image(config.image):
                 raise RuntimeError(f"Failed to ensure Docker image: {config.image}")
 
             sandbox_id = str(uuid.uuid4())
             try:
-                sandbox = DockerSandbox(config, volume_bindings)
-                await sandbox.create()
-
-                self._sandboxes[sandbox_id] = sandbox
-                self._last_used[sandbox_id] = asyncio.get_event_loop().time()
-                self._locks[sandbox_id] = asyncio.Lock()
-
-                logger.info(f"Created sandbox {sandbox_id}")
-                return sandbox_id
-
+                # DockerSandbox.create() releases its own resources on failure.
+                sandbox = await DockerSandbox(config, volume_bindings).create()
             except Exception as e:
                 logger.error(f"Failed to create sandbox: {e}")
-                if sandbox_id in self._sandboxes:
-                    await self.delete_sandbox(sandbox_id)
-                raise RuntimeError(f"Failed to create sandbox: {e}")
+                raise RuntimeError(f"Failed to create sandbox: {e}") from e
+
+            async with self._global_lock:
+                self._sandboxes[sandbox_id] = sandbox
+                self._last_used[sandbox_id] = asyncio.get_running_loop().time()
+                self._locks[sandbox_id] = asyncio.Lock()
+
+            logger.info(f"Created sandbox {sandbox_id}")
+            return sandbox_id
+        finally:
+            async with self._global_lock:
+                self._pending_creations -= 1
 
     async def get_sandbox(self, sandbox_id: str) -> DockerSandbox:
         """Gets a sandbox instance.
@@ -186,7 +190,7 @@ class SandboxManager:
 
     async def _cleanup_idle_sandboxes(self) -> None:
         """Cleans up idle sandboxes."""
-        current_time = asyncio.get_event_loop().time()
+        current_time = asyncio.get_running_loop().time()
         to_cleanup = []
 
         async with self._global_lock:

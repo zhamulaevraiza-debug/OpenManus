@@ -9,6 +9,9 @@ from app.config import SandboxSettings
 from app.sandbox.client import LocalSandboxClient, create_sandbox_client
 
 
+pytestmark = pytest.mark.docker
+
+
 @pytest_asyncio.fixture(scope="function")
 async def local_client() -> AsyncGenerator[LocalSandboxClient, None]:
     """Creates a local sandbox client for testing."""
@@ -38,7 +41,7 @@ async def test_sandbox_creation(local_client: LocalSandboxClient):
 
     await local_client.create(config)
     result = await local_client.run_command("python3 --version")
-    assert "Python 3.10" in result
+    assert "Python 3.12" in result
 
 
 @pytest.mark.asyncio

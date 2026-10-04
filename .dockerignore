@@ -1,0 +1,50 @@
+# Build context of the Dockerfile: only what the image needs. Local state and secrets
+# (config.toml with API keys, .env, data, logs) must never end up in an image.
+
+# Version control, CI, editors
+.git
+.github
+.vscode
+.idea
+**/.DS_Store
+
+# Local configuration and state
+.env
+.env.*
+config/config.toml
+config/mcp.json
+config/*.bak
+data
+logs
+workspace
+**/*.log
+
+# Python caches and virtual environments
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.venv
+venv
+
+# Node dependencies and build output (installed/built inside the image)
+**/node_modules
+web/dist
+web/e2e
+web/playwright.config.ts
+web/test-results
+web/playwright-report
+web/blob-report
+
+# Not used at runtime
+tests
+docs
+assets
+examples
+protocol
+scripts
+README*.md
+CODE_OF_CONDUCT.md
+Dockerfile
+docker-compose*.yml

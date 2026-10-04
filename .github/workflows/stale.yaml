@@ -6,6 +6,8 @@ on:
 
 jobs:
   close-issues:
+    # Issue housekeeping of the upstream project only.
+    if: github.repository == 'FoundationAgents/OpenManus'
     runs-on: ubuntu-latest
     permissions:
       issues: write

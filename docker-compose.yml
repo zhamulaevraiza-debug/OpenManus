@@ -1,0 +1,95 @@
+# OpenManus web — see docs/DEPLOY.md (Russian) or docs/DEPLOY.en.md.
+#
+#   cp .env.example .env                        # then edit .env
+#   docker compose up -d --build                # http://<server>:8000
+#   docker compose --profile https up -d --build   # https://$DOMAIN via Caddy
+#
+# Variables in ${...} are read from .env (or the shell); .env is also passed to the
+# server container, so every OPENMANUS_* setting can be put there.
+
+name: openmanus
+
+services:
+  openmanus:
+    build:
+      context: .
+    image: openmanus-web:latest
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Fixed inside the container; OPENMANUS_PORT in .env selects the host port.
+      OPENMANUS_HOST: 0.0.0.0
+      OPENMANUS_PORT: "8000"
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${OPENMANUS_PORT:-8000}:8000"
+    volumes:
+      - openmanus-data:/data
+    # Lets the server reach services on the Docker host, e.g. Ollama at
+    # http://host.docker.internal:11434/v1.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    # Chromium needs more shared memory than Docker's 64 MB default.
+    shm_size: 1gb
+    # The server runs as root with only the capabilities it needs: switching to the
+    # unprivileged "agent" account for agent code (SETUID, SETGID), handing workspaces
+    # to it (CHOWN, FOWNER, DAC_OVERRIDE) and stopping its processes (KILL).
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    # Guards the host against runaway agent code (fork bombs).
+    pids_limit: 4096
+    # Running tasks are cancelled gracefully on shutdown.
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles:
+      - https
+    restart: unless-stopped
+    depends_on:
+      openmanus:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    command:
+      - sh
+      - -c
+      - >-
+        if [ -z "$$DOMAIN" ] || [ -z "$$ACME_EMAIL" ]; then
+        echo "Set DOMAIN and ACME_EMAIL in .env to use the https profile" >&2; exit 1;
+        fi;
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  openmanus-data:
+  caddy-data:
+  caddy-config:

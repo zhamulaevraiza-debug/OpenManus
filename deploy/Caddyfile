@@ -1,0 +1,37 @@
+# HTTPS reverse proxy for OpenManus (docker compose --profile https).
+# Caddy obtains and renews a Let's Encrypt certificate for $DOMAIN automatically;
+# DOMAIN and ACME_EMAIL come from .env.
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	# Compress assets and API responses. The event stream (text/event-stream) is left
+	# out on purpose: live updates must reach the browser immediately.
+	encode {
+		zstd
+		gzip
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type text/markdown*
+			header Content-Type text/csv*
+			header Content-Type text/javascript*
+			header Content-Type application/javascript*
+			header Content-Type application/json*
+			header Content-Type application/manifest+json*
+			header Content-Type image/svg+xml*
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	reverse_proxy openmanus:8000 {
+		# Stream responses (Server-Sent Events, downloads) without buffering.
+		flush_interval -1
+	}
+}

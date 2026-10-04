@@ -7,6 +7,8 @@ on:
 
 jobs:
   deploy:
+    # Publishes to PyPI with the upstream project's token.
+    if: github.repository == 'FoundationAgents/OpenManus'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

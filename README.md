@@ -116,6 +116,50 @@ base_url = "https://api.openai.com/v1"
 api_key = "sk-..."  # Replace with your actual API key
 ```
 
+## 🌐 Web UI (desktop & mobile)
+
+OpenManus also runs as a self-hosted, multi-user web app. All agents — Manus, Browser,
+Researcher, Coder, Data Analyst, Writer and the Daytona Sandbox — work alone or together as a
+team in a chat with live activity (plans, tool calls, screenshots), a file workspace per
+conversation, questions from agents answered in the chat, a Russian/English interface, and an
+installable app for Android and iOS (PWA).
+
+<table>
+  <tr>
+    <td width="74%"><img src="docs/screenshots/chat-desktop-light.png" alt="A team run: the plan with both steps done, the agents' tool calls and the answer"></td>
+    <td width="26%"><img src="docs/screenshots/chat-mobile-dark.png" alt="The same chat on a phone, dark theme"></td>
+  </tr>
+</table>
+
+<details>
+<summary>More screenshots: files, settings, sign-in (light and dark)</summary>
+
+| | Desktop | Phone |
+|---|---|---|
+| Files | <img src="docs/screenshots/files-desktop-dark.png" alt="Files panel with a rendered Markdown preview" width="560"> | <img src="docs/screenshots/files-mobile-light.png" alt="File preview on a phone" width="180"> |
+| Settings | <img src="docs/screenshots/settings-desktop-light.png" alt="Model settings with a masked API key" width="560"> | <img src="docs/screenshots/settings-mobile-dark.png" alt="Model settings on a phone" width="180"> |
+| Sign-in | <img src="docs/screenshots/login-desktop-dark.png" alt="Sign-in page" width="560"> | <img src="docs/screenshots/login-mobile-light.png" alt="Sign-in page on a phone" width="180"> |
+
+All screenshots (both themes, both languages) are in [docs/screenshots](docs/screenshots);
+they are generated from the running app by `scripts/e2e.sh --screenshots`.
+</details>
+
+From the repository root, with Docker installed:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose exec openmanus cat /data/initial_admin_password.txt
+```
+
+Open `http://<your-server>:8000`, sign in as `admin` with that password and connect a model in
+**Settings → Model** (OpenAI, Anthropic, OpenRouter, DeepSeek, Gemini, Azure, Bedrock or Ollama).
+
+- [Deployment guide](docs/DEPLOY.en.md): VPS setup, HTTPS with your domain, installing on phones,
+  users, backups, updates, troubleshooting, security · [на русском](docs/DEPLOY.md)
+- [Architecture](docs/ARCHITECTURE.md): components, events, run lifecycle, adding agents and tools
+- [README на русском](README_ru.md)
+
 ## Quick Start
 
 One line for run OpenManus:

@@ -207,3 +207,5 @@ web/dist/
 web/test-results/
 web/playwright-report/
 config/config.toml.bak
+config/mcp.json
+config/mcp.json.bak
